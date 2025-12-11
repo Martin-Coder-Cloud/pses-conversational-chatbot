@@ -13,6 +13,12 @@ from pses_chatbot.core.metadata_loader import (
     load_org_meta,
     load_posneg_meta,
 )
+from pses_chatbot.core.query_engine import (
+    QueryParameters,
+    run_analytical_query,
+    QueryEngineError,
+)
+from pses_chatbot.core.audit import build_audit_snapshot
 
 
 def _render_chat_area() -> None:
@@ -24,6 +30,7 @@ def _render_chat_area() -> None:
       - parameter inference
       - data retrieval
       - narrative generation
+      - audit of statements vs data
     """
     st.subheader("Prototype chat area")
 
@@ -57,7 +64,8 @@ def _render_chat_area() -> None:
             "- Infer the PSES question, years, demographics, organization and level from your text\n"
             "- Query the PSES open data API for the corresponding slice of the dataset\n"
             "- Generate a short, validated analytical summary\n"
-            "- Show you the data table used for the answer"
+            "- Show you the data table used for the answer\n"
+            "- Provide an audit view so you can verify that every statement matches the data"
         )
         st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
 
@@ -69,12 +77,10 @@ def _render_backend_status() -> None:
     """
     Developer-only backend status panel.
 
-    This lets you quickly test:
+    Tests:
       - Connectivity to the CKAN DataStore API
       - That PSES_DATASTORE_RESOURCE_ID is valid
       - The basic schema (columns) of the PSES results table
-
-    It does NOT run automatically; it only runs when you click the button.
     """
     with st.expander("Backend status (developer view)", expanded=False):
         st.markdown(
@@ -95,6 +101,8 @@ def _render_backend_status() -> None:
         )
 
         if st.button("Run test query (max 1,000 rows)"):
+            from pses_chatbot.core.data_loader import query_pses_results
+
             try:
                 with st.spinner("Querying PSES DataStore (this may take a few seconds)..."):
                     df = query_pses_results(
@@ -133,14 +141,12 @@ def _render_metadata_status() -> None:
     """
     Developer-only metadata status panel.
 
-    This loads all key metadata from the Excel workbook:
+    Loads metadata from the Excel workbook:
       - Questions
       - Scales (answer options)
       - Demographics
       - Organization hierarchy
       - Positive/Neutral/Negative/Agree mappings
-
-    and displays basic counts so you can confirm everything is wired correctly.
     """
     with st.expander("Metadata status (developer view)", expanded=False):
         st.markdown(
@@ -200,9 +206,9 @@ def _render_metadata_status() -> None:
                     sample_d = d.iloc[0]
                     st.markdown(
                         "  - Example: "
-                        f"DEMCODE `{sample_d['demcode']}` – "
+                        f"DEMCODE `{sample_d.get('code', sample_d.get('demcode', ''))}` – "
                         f"EN: *{sample_d['label_en'][:60]}* "
-                        f"(BYCOND: {sample_d['bycond']})"
+                        f"(BYCOND: {sample_d.get('bycond', '')})"
                     )
 
                 st.markdown("---")
@@ -241,6 +247,193 @@ def _render_metadata_status() -> None:
                 )
 
 
+def _render_analytical_query_tester() -> None:
+    """
+    Developer-only analytical query tester.
+
+    This lets you manually specify:
+      - SURVEYR list
+      - QUESTION
+      - DEMCODE (including "" for overall / no breakdown)
+      - LEVEL1ID..LEVEL5ID
+
+    It then:
+      - Calls run_analytical_query(...)
+      - Shows yearly metrics (MOST POSITIVE OR LEAST NEGATIVE)
+      - Builds and displays audit facts (AuditSnapshot)
+      - Shows the raw slice in a table
+
+    This is the core of the future conversational engine + audit layer.
+    """
+    with st.expander("Analytical query test (developer view)", expanded=False):
+        st.markdown(
+            """
+            Use this panel to exercise the analytical query engine and audit layer.
+
+            All four pillars must be specified:
+            - **SURVEYR** (list of survey years)  
+            - **QUESTION** (e.g., `Q08`)  
+            - **DEMCODE** (e.g., `1001` for a demographic, or empty `\"\"` for no breakdown)  
+            - **LEVEL1ID–LEVEL5ID** (organization scope)  
+            """
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            question_code = st.text_input(
+                "Question code (QUESTION, e.g. Q08):",
+                value="Q08",
+            )
+            years_str = st.text_input(
+                "Survey years (comma-separated, e.g. 2019,2020,2021,2022,2023,2024):",
+                value="2019,2020,2021,2022,2023,2024",
+            )
+            demcode_input = st.text_input(
+                "DEMCODE (empty string \"\" means no breakdown / overall):",
+                value="",
+            )
+
+        with col2:
+            st.markdown("**Organization levels** (integers; leave blank if not used at that level)")
+            level1id_str = st.text_input("LEVEL1ID:", value="")
+            level2id_str = st.text_input("LEVEL2ID:", value="")
+            level3id_str = st.text_input("LEVEL3ID:", value="")
+            level4id_str = st.text_input("LEVEL4ID:", value="")
+            level5id_str = st.text_input("LEVEL5ID:", value="")
+
+        if st.button("Run analytical query"):
+            try:
+                # Parse years
+                years = []
+                for part in years_str.split(","):
+                    p = part.strip()
+                    if not p:
+                        continue
+                    years.append(int(p))
+
+                if not years:
+                    st.error("Please specify at least one survey year.")
+                    return
+
+                # DEMCODE: empty input means no breakdown
+                demcode = demcode_input  # may be ""
+
+                # Org levels: build dict only with filled values
+                org_levels: dict[str, int] = {}
+                if level1id_str.strip():
+                    org_levels["LEVEL1ID"] = int(level1id_str.strip())
+                if level2id_str.strip():
+                    org_levels["LEVEL2ID"] = int(level2id_str.strip())
+                if level3id_str.strip():
+                    org_levels["LEVEL3ID"] = int(level3id_str.strip())
+                if level4id_str.strip():
+                    org_levels["LEVEL4ID"] = int(level4id_str.strip())
+                if level5id_str.strip():
+                    org_levels["LEVEL5ID"] = int(level5id_str.strip())
+
+                if not org_levels:
+                    st.error("Please specify at least LEVEL1ID for this test.")
+                    return
+
+                params = QueryParameters(
+                    survey_years=years,
+                    question_code=question_code,
+                    demcode=demcode,
+                    org_levels=org_levels,
+                )
+
+                with st.spinner("Running analytical query and building audit snapshot..."):
+                    result = run_analytical_query(params)
+                    snapshot = build_audit_snapshot(result)
+
+                st.success("Analytical query succeeded.")
+
+                # Labels
+                st.markdown("### Labels")
+                st.markdown(
+                    f"- **Question:** `{snapshot.question_code}` – EN: *{snapshot.question_label_en}*"
+                )
+                if snapshot.org_label_en:
+                    st.markdown(f"- **Organization:** {snapshot.org_label_en}")
+                if snapshot.dem_label_en:
+                    st.markdown(f"- **Demographic:** {snapshot.dem_label_en}")
+                else:
+                    st.markdown(f"- **Demographic:** {snapshot.dem_label_en or 'Overall (all respondents)'}")
+
+                st.markdown(f"- **Metric:** {snapshot.metric_name_en}")
+
+                # Yearly metrics table
+                st.markdown("### Yearly metrics (MOST POSITIVE OR LEAST NEGATIVE)")
+                rows = []
+                for m in result.yearly_metrics:
+                    rows.append(
+                        {
+                            "Year": m.year,
+                            "Value": m.value,
+                            "Δ vs previous year": m.delta_vs_prev,
+                            "N (ANSCOUNT)": m.n,
+                        }
+                    )
+                import pandas as pd
+
+                metrics_df = pd.DataFrame(rows)
+                st.dataframe(metrics_df, use_container_width=True)
+
+                # Overall change
+                st.markdown("### Overall change")
+                if snapshot.overall_delta is not None:
+                    st.markdown(
+                        f"- Overall change ({min(snapshot.metrics_by_year.keys())} → "
+                        f"{max(snapshot.metrics_by_year.keys())}): "
+                        f"{snapshot.overall_delta:+.1f} points "
+                        f"({snapshot.overall_direction})"
+                    )
+                else:
+                    st.markdown("- Overall change: not available (insufficient data).")
+
+                # Audit facts
+                st.markdown("### Audit facts (for AI and human validation)")
+                st.markdown(
+                    "These are the canonical numerical facts that any AI-generated "
+                    "statement must be consistent with."
+                )
+
+                st.markdown("**Metrics by year**")
+                for year in sorted(snapshot.metrics_by_year.keys()):
+                    val = snapshot.metrics_by_year[year]
+                    n = snapshot.n_by_year.get(year)
+                    st.markdown(
+                        f"- {year}: {val:.1f} (N={n if n is not None else 'N/A'})"
+                    )
+
+                st.markdown("**Year-over-year trends**")
+                if not snapshot.trend_facts:
+                    st.markdown("- No year-over-year comparisons available.")
+                else:
+                    for fact in snapshot.trend_facts:
+                        st.markdown(
+                            f"- {fact.year_start} → {fact.year_end}: "
+                            f"{fact.value_start:.1f} → {fact.value_end:.1f} "
+                            f"({fact.delta:+.1f} pts, {fact.direction})"
+                        )
+
+                # Raw slice
+                st.markdown("### Raw data slice (supporting table)")
+                st.dataframe(result.raw_df, use_container_width=True)
+
+            except QueryEngineError as qerr:
+                st.error(f"Analytical query failed: {qerr}")
+            except Exception as e:
+                st.error("Unexpected error while running analytical query.")
+                st.code(repr(e))
+                st.text_area(
+                    "Traceback (for debugging)",
+                    value=traceback.format_exc(),
+                    height=260,
+                )
+
+
 def run_app() -> None:
     """
     Main UI entrypoint for the PSES Conversational Analytics Chatbot.
@@ -250,6 +443,7 @@ def run_app() -> None:
       - Placeholder chat area
       - Backend status panel for data loader (CKAN)
       - Metadata status panel for Excel-based metadata
+      - Analytical query tester + audit view (developer-only)
     """
     st.set_page_config(
         page_title=APP_NAME,
@@ -270,7 +464,7 @@ def run_app() -> None:
         - Clarifying questions only when strictly necessary  
 
         The current build is a skeleton. The conversational engine and data pipeline 
-        will be implemented step by step.
+        are being implemented step by step, with a focus on strict, auditable use of data.
         """
     )
 
@@ -281,3 +475,5 @@ def run_app() -> None:
     _render_backend_status()
     st.markdown("---")
     _render_metadata_status()
+    st.markdown("---")
+    _render_analytical_query_tester()
