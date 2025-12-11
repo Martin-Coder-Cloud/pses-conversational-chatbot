@@ -1,7 +1,8 @@
 from __future__ import annotations
 import streamlit as st
 
-from src.pses_chatbot.config import APP_NAME, APP_VERSION
+from pses_chatbot.config import APP_NAME, APP_VERSION
+
 
 def run_app() -> None:
     """
@@ -67,8 +68,8 @@ def run_app() -> None:
         bot_reply = (
             "Thanks for your question! The conversational analytics engine is not implemented yet.\n\n"
             "In the next steps, this chatbot will:\n"
-            "- Infer the PSES question, years, demographics, and organization from your text\n"
-            "- Retrieve the corresponding data from the PSES dataset\n"
+            "- Infer the PSES question, years, demographics, organization and level from your text\n"
+            "- Retrieve the corresponding data from the full PSES dataset (PS-wide + departments)\n"
             "- Generate a short, validated analytical summary\n"
             "- Show you the data table used for the answer"
         )
