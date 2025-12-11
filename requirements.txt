@@ -11,3 +11,6 @@ torch>=2.2.0
 
 # For type hints / dev
 typing-extensions>=4.10.0
+
+requests>=2.31.0
+
