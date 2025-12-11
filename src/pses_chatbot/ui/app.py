@@ -6,6 +6,13 @@ import streamlit as st
 
 from pses_chatbot.config import APP_NAME, APP_VERSION
 from pses_chatbot.core.data_loader import query_pses_results
+from pses_chatbot.core.metadata_loader import (
+    load_questions_meta,
+    load_scales_meta,
+    load_demographics_meta,
+    load_org_meta,
+    load_posneg_meta,
+)
 
 
 def _render_chat_area() -> None:
@@ -122,6 +129,118 @@ def _render_backend_status() -> None:
                 )
 
 
+def _render_metadata_status() -> None:
+    """
+    Developer-only metadata status panel.
+
+    This loads all key metadata from the Excel workbook:
+      - Questions
+      - Scales (answer options)
+      - Demographics
+      - Organization hierarchy
+      - Positive/Neutral/Negative/Agree mappings
+
+    and displays basic counts so you can confirm everything is wired correctly.
+    """
+    with st.expander("Metadata status (developer view)", expanded=False):
+        st.markdown(
+            """
+            This section loads metadata from the Excel workbook under `data/metadata/`.
+
+            It will attempt to read:
+            - **QUESTIONS** sheet  
+            - **RESPONSE OPTIONS DE RÉPONSES** sheet  
+            - **DEMCODE** sheet  
+            - **LEVEL1ID_LEVEL5ID** sheet  
+            - **POSITIVE_NEUTRAL_NEGATIVE_AGREE** sheet  
+
+            and summarize how many records are found in each.
+            """
+        )
+
+        if st.button("Load metadata and show summary"):
+            try:
+                with st.spinner("Loading questions metadata..."):
+                    q = load_questions_meta(refresh=True)
+                with st.spinner("Loading scales metadata..."):
+                    s = load_scales_meta(refresh=True)
+                with st.spinner("Loading demographics metadata..."):
+                    d = load_demographics_meta(refresh=True)
+                with st.spinner("Loading organization metadata..."):
+                    o = load_org_meta(refresh=True)
+                with st.spinner("Loading pos/neg/agree metadata..."):
+                    p = load_posneg_meta(refresh=True)
+
+                st.success("Metadata loaded successfully.")
+
+                st.markdown("**Questions**")
+                st.markdown(f"- Questions: **{len(q)}**")
+                if not q.empty:
+                    sample_q = q.iloc[0]
+                    st.markdown(
+                        f"  - Example: `{sample_q['code']}` – EN: *{sample_q['text_en'][:80]}*"
+                    )
+
+                st.markdown("---")
+                st.markdown("**Scales / answer options**")
+                st.markdown(f"- Question–option records: **{len(s)}**")
+                if not s.empty:
+                    sample_s = s.iloc[0]
+                    st.markdown(
+                        "  - Example: "
+                        f"question `{sample_s['question_code']}`, "
+                        f"option {sample_s['option_index']} – "
+                        f"EN: *{sample_s['label_en'][:60]}*"
+                    )
+
+                st.markdown("---")
+                st.markdown("**Demographics**")
+                st.markdown(f"- Demographic codes: **{len(d)}**")
+                if not d.empty:
+                    sample_d = d.iloc[0]
+                    st.markdown(
+                        "  - Example: "
+                        f"DEMCODE `{sample_d['demcode']}` – "
+                        f"EN: *{sample_d['label_en'][:60]}* "
+                        f"(BYCOND: {sample_d['bycond']})"
+                    )
+
+                st.markdown("---")
+                st.markdown("**Organization hierarchy**")
+                st.markdown(f"- Org rows: **{len(o)}**")
+                if not o.empty:
+                    sample_o = o.iloc[0]
+                    st.markdown(
+                        "  - Example: "
+                        f"LEVEL1ID={sample_o['LEVEL1ID']}, "
+                        f"LEVEL2ID={sample_o['LEVEL2ID']}, "
+                        f"UNITID={sample_o['UNITID']} – "
+                        f"EN: *{sample_o['org_name_en'][:60]}* "
+                        f"(DEPT code: {sample_o['dept_code']})"
+                    )
+
+                st.markdown("---")
+                st.markdown("**Positive / Neutral / Negative / Agree**")
+                st.markdown(f"- Question mappings: **{len(p)}**")
+                if not p.empty:
+                    sample_p = p.iloc[0]
+                    st.markdown(
+                        "  - Example: "
+                        f"question `{sample_p['question_code']}` – "
+                        f"positive positions: {sample_p['positive_positions']}, "
+                        f"agree positions: {sample_p['agree_positions']}"
+                    )
+
+            except Exception as e:
+                st.error("Error while loading metadata.")
+                st.code(repr(e))
+                st.text_area(
+                    "Traceback (for debugging)",
+                    value=traceback.format_exc(),
+                    height=260,
+                )
+
+
 def run_app() -> None:
     """
     Main UI entrypoint for the PSES Conversational Analytics Chatbot.
@@ -129,7 +248,8 @@ def run_app() -> None:
     Currently includes:
       - App header and description
       - Placeholder chat area
-      - Backend status panel for testing the data loader
+      - Backend status panel for data loader (CKAN)
+      - Metadata status panel for Excel-based metadata
     """
     st.set_page_config(
         page_title=APP_NAME,
@@ -159,3 +279,5 @@ def run_app() -> None:
     _render_chat_area()
     st.markdown("---")
     _render_backend_status()
+    st.markdown("---")
+    _render_metadata_status()
