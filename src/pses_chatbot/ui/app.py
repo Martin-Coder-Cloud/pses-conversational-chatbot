@@ -1,7 +1,7 @@
 from __future__ import annotations
 import streamlit as st
 
-from pses_chatbot.config import APP_NAME, APP_VERSION
+from src.pses_chatbot.config import APP_NAME, APP_VERSION
 
 def run_app() -> None:
     """
