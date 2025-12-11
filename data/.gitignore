@@ -1,1 +1,11 @@
+# Raw and derived PSES data files
+*.csv
+*.csv.gz
+*.parquet
+*.feather
+*.xlsx
+*.xls
 
+# Any local test data
+*.pkl
+*.json
