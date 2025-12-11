@@ -1,166 +1,163 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
+import json
 import logging
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
 
-from pses_chatbot.config import (
-    CKAN_DATASTORE_SEARCH_URL,
-    PSES_DATASTORE_RESOURCE_ID,
-)
+from pses_chatbot.config import PSES_DATASTORE_RESOURCE_ID
 
 logger = logging.getLogger(__name__)
 
+CKAN_DATASTORE_SEARCH_URL = (
+    "https://open.canada.ca/data/en/api/3/action/datastore_search"
+)
 
-# ---------------------------------------------------------------------------
-# Low-level CKAN DataStore client
-# ---------------------------------------------------------------------------
+
+class DataLoaderError(Exception):
+    """Custom exception for DataStore query failures."""
+
 
 def _datastore_search(
     resource_id: str,
     filters: Optional[Dict[str, Any]] = None,
     fields: Optional[List[str]] = None,
-    q: Optional[str] = None,
     sort: Optional[str] = None,
     offset: int = 0,
-    limit: int = 1_000,
+    limit: int = 1000,
 ) -> Dict[str, Any]:
     """
-    Call CKAN datastore_search for a single page of results.
+    Low-level wrapper around CKAN's datastore_search.
 
-    Docs:
-      https://open.canada.ca/data/en/api/3/action/datastore_search
+    IMPORTANT:
+      - CKAN expects 'filters' as a JSON-encoded string.
+      - If we pass a dict directly, requests will serialize it incorrectly
+        (e.g., filters=QUESTION&filters=DEMCODE...), causing 500 errors.
 
     Parameters
     ----------
     resource_id : str
-        CKAN resource_id (the table ID in the DataStore).
+        CKAN resource ID (PSES main table).
     filters : dict, optional
-        CKAN 'filters' parameter, e.g. {"SURVEY_YEAR": 2024, "QSTCD": "Q08"}.
-    fields : list of str, optional
-        Restrict returned fields/columns to this subset (saves bandwidth).
-    q : str, optional
-        Full-text search query (not used in our core analytics, but available).
+        Dict of equality filters, e.g. {"QUESTION": "Q08", "SURVEYR": 2024}.
+    fields : list[str], optional
+        Subset of columns to return.
     sort : str, optional
-        Sort expression, e.g. "SURVEY_YEAR asc".
+        Sort expression (CKAN style), e.g. "SURVEYR asc".
     offset : int
-        Row offset for pagination.
+        Starting offset for paging.
     limit : int
-        Page size (max rows to return in this call).
+        Max number of rows to return in this call.
 
     Returns
     -------
     dict
-        Parsed JSON response from CKAN.
+        The 'result' object from CKAN's JSON response.
     """
-    if not resource_id:
-        raise RuntimeError(
-            "PSES_DATASTORE_RESOURCE_ID is not configured. "
-            "Set it as an environment variable or Streamlit secret."
-        )
-
     params: Dict[str, Any] = {
         "resource_id": resource_id,
         "offset": offset,
         "limit": limit,
     }
 
-    if filters:
-        params["filters"] = filters
+    # Correct handling of filters: must be JSON-encoded
+    if filters is not None:
+        params["filters"] = json.dumps(filters)
+
     if fields:
-        # CKAN allows a comma-separated string for the 'fields' param
+        # CKAN allows comma-separated list of field names
         params["fields"] = ",".join(fields)
-    if q:
-        params["q"] = q
     if sort:
         params["sort"] = sort
 
     logger.info(
-        "CKAN datastore_search: resource=%s offset=%d limit=%d filters=%s",
-        resource_id,
+        "Calling CKAN datastore_search with params (offset=%s, limit=%s, filters=%s)",
         offset,
         limit,
         filters,
     )
 
-    resp = requests.get(CKAN_DATASTORE_SEARCH_URL, params=params, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.get(CKAN_DATASTORE_SEARCH_URL, params=params, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.error("HTTP error while calling datastore_search: %s", exc)
+        raise DataLoaderError(f"HTTP error while calling datastore_search: {exc}") from exc
 
-    if not data.get("success", False):
-        raise RuntimeError(
-            f"CKAN datastore_search failed: {data.get('error') or 'Unknown error'}"
-        )
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        logger.error("Invalid JSON from datastore_search: %s", exc)
+        raise DataLoaderError(f"Invalid JSON from datastore_search: {exc}") from exc
 
-    return data
+    if not payload.get("success", False):
+        logger.error("CKAN reported failure: %s", payload)
+        raise DataLoaderError(f"CKAN reported failure: {payload}")
 
+    result = payload.get("result", {})
+    return result
 
-# ---------------------------------------------------------------------------
-# Public API: query PSES results in slices
-# ---------------------------------------------------------------------------
 
 def query_pses_results(
+    resource_id: Optional[str] = None,
     filters: Optional[Dict[str, Any]] = None,
     fields: Optional[List[str]] = None,
     sort: Optional[str] = None,
-    max_rows: int = 200_000,
-    page_size: int = 50_000,
+    max_rows: int = 50_000,
+    page_size: int = 10_000,
 ) -> pd.DataFrame:
     """
-    Query the PSES DataStore and return a DataFrame of matching rows.
+    Higher-level helper to fetch PSES records from the DataStore.
 
-    IMPORTANT:
-    - This function is *not* meant to load the full dataset (15M+ rows).
-    - It will paginate through datastore_search until:
-        * it has collected `max_rows` records, OR
-        * it has reached the server-reported total, whichever comes first.
+    This function:
+      - Uses the configured PSES_DATASTORE_RESOURCE_ID by default.
+      - Applies equality filters if provided.
+      - Pages through the DataStore until:
+          * we have fetched 'max_rows' records, OR
+          * no more records are returned.
+      - Returns a pandas DataFrame (may be empty).
 
     Parameters
     ----------
+    resource_id : str, optional
+        CKAN resource ID. If None, uses PSES_DATASTORE_RESOURCE_ID from config.
     filters : dict, optional
-        CKAN 'filters' parameter, e.g. {"SURVEY_YEAR": 2024, "QSTCD": "Q08"}.
-        The higher-level queries layer will build these filters from
-        question codes, years, organization IDs (LEVEL1/2/3), and DEMCODEs.
-    fields : list of str, optional
-        Restrict returned columns to a subset (saves bandwidth and memory).
-        Example: ["SURVEY_YEAR", "QSTCD", "LEVEL1ID", "DEMCODE", "PERCENT_POSITIVE", "N"]
+        Dict of equality filters, e.g. {"QUESTION": "Q08", "SURVEYR": 2024}.
+    fields : list[str], optional
+        Limit returned columns to this subset.
     sort : str, optional
-        Sort expression (rarely needed for our analytics use cases).
+        CKAN sort expression, e.g. "SURVEYR asc".
     max_rows : int
-        Safety cap: maximum number of rows to fetch across all pages.
+        Hard cap on total rows to fetch.
     page_size : int
-        Number of rows per datastore_search call (server limit is typically 100_000).
+        Number of rows to request per call to datastore_search.
 
     Returns
     -------
-    pandas.DataFrame
-        DataFrame with up to `max_rows` records matching the filters.
+    pd.DataFrame
+        DataFrame with the collected records.
     """
-    resource_id = PSES_DATASTORE_RESOURCE_ID
+    if resource_id is None:
+        resource_id = PSES_DATASTORE_RESOURCE_ID
+
     if not resource_id:
-        raise RuntimeError(
-            "PSES_DATASTORE_RESOURCE_ID is not configured. "
-            "Set it as an environment variable or Streamlit secret."
-        )
+        raise DataLoaderError("PSES_DATASTORE_RESOURCE_ID is not configured.")
+
+    if page_size <= 0:
+        raise ValueError("page_size must be positive.")
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive.")
 
     all_records: List[Dict[str, Any]] = []
     offset = 0
-    total: Optional[int] = None
 
-    while True:
+    while len(all_records) < max_rows:
         remaining = max_rows - len(all_records)
-        if remaining <= 0:
-            logger.info(
-                "Reached max_rows=%d; stopping CKAN paging.", max_rows
-            )
-            break
-
         page_limit = min(page_size, remaining)
 
-        page = _datastore_search(
+        result = _datastore_search(
             resource_id=resource_id,
             filters=filters,
             fields=fields,
@@ -169,35 +166,20 @@ def query_pses_results(
             limit=page_limit,
         )
 
-        result = page.get("result", {})
-        if total is None:
-            total = int(result.get("total", 0))
-
         records = result.get("records", [])
         if not records:
-            logger.info(
-                "No more records returned from CKAN (offset=%d); stopping.", offset
-            )
+            # No more data available
             break
 
         all_records.extend(records)
         offset += len(records)
 
-        logger.info(
-            "Fetched %d records (cumulative=%d, total=%s)",
-            len(records),
-            len(all_records),
-            total,
-        )
-
-        # Extra guard: if we've consumed all records up to total, stop
-        if total is not None and offset >= total:
+        # If returned fewer than requested, we've hit the end
+        if len(records) < page_limit:
             break
 
+    if not all_records:
+        return pd.DataFrame()
+
     df = pd.DataFrame.from_records(all_records)
-    logger.info(
-        "query_pses_results: final DataFrame shape %s (filters=%s)",
-        df.shape,
-        filters,
-    )
     return df
