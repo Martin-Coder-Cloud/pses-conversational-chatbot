@@ -30,26 +30,20 @@ def _resolve_ckan_search_url() -> str:
 
 
 def _resolve_ckan_sql_url() -> str:
-    """
-    Prefer CKAN_BASE_URL if available, otherwise derive from CKAN_DATASTORE_SEARCH_URL.
-    """
     base = getattr(cfg, "CKAN_BASE_URL", "").strip()
     if base:
         return f"{base}/datastore_search_sql"
 
-    # Derive from .../datastore_search
     search = _resolve_ckan_search_url()
     if search.endswith("/datastore_search"):
-        return search[:-len("/datastore_search")] + "/datastore_search_sql"
+        return search[: -len("/datastore_search")] + "/datastore_search_sql"
     return "https://open.canada.ca/data/en/api/3/action/datastore_search_sql"
 
 
 def _resolve_resource_id() -> str:
     rid = getattr(cfg, "PSES_DATASTORE_RESOURCE_ID", "").strip()
     if not rid:
-        raise DataLoaderError(
-            "Missing CKAN resource id in config.py. Expected: PSES_DATASTORE_RESOURCE_ID"
-        )
+        raise DataLoaderError("Missing CKAN resource id in config.py. Expected: PSES_DATASTORE_RESOURCE_ID")
     return rid
 
 
@@ -59,10 +53,10 @@ CKAN_DATASTORE_SEARCH_SQL_URL = _resolve_ckan_sql_url()
 
 def _clean_filters(filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    CKAN datastore_search expects a JSON object for `filters`.
+    CKAN datastore_search expects `filters` as a JSON object (equality only).
 
-    Preserve empty-string values intentionally (e.g., DEMCODE="").
-    Remove only keys whose value is None.
+    Preserve empty-string values intentionally.
+    Remove only keys whose value is None (caller may use None as sentinel).
     """
     if not filters:
         return None
@@ -93,7 +87,7 @@ def _datastore_search(
     sort: Optional[str] = None,
     offset: int = 0,
     limit: int = 5_000,
-    include_total: bool = True,
+    include_total: bool = False,
     timeout_seconds: int = 90,
     max_retries: int = 4,
     backoff_seconds: float = 1.0,
@@ -105,6 +99,8 @@ def _datastore_search(
     - Sends filters as JSON object (CKAN-correct).
     - Retries on timeouts/transient errors with exponential backoff.
     - On timeout, automatically reduces `limit` and retries.
+
+    NOTE: include_total defaults to False for analytical queries (faster/safer).
     """
     sess = _session()
     cleaned_filters = _clean_filters(filters)
@@ -183,8 +179,7 @@ def _datastore_search_sql(
     backoff_seconds: float = 1.0,
 ) -> List[Dict[str, Any]]:
     """
-    Calls CKAN datastore_search_sql with retries.
-    Returns `records` list.
+    Calls CKAN datastore_search_sql with retries and returns records.
     """
     sess = _session()
     params = {"sql": sql}
@@ -197,11 +192,12 @@ def _datastore_search_sql(
                 resp = sess.get(CKAN_DATASTORE_SEARCH_SQL_URL, params=params, timeout=timeout_seconds)
                 resp.raise_for_status()
                 payload = resp.json()
+
                 if not isinstance(payload, dict) or not payload.get("success", False):
                     raise DataLoaderError(f"CKAN datastore_search_sql returned success=false: {payload}")
+
                 result = payload.get("result", {}) or {}
-                records = result.get("records", []) or []
-                return records
+                return result.get("records", []) or []
 
             except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
                 if attempt > max_retries:
@@ -236,17 +232,14 @@ def get_available_survey_years(
     timeout_seconds: int = 90,
 ) -> List[int]:
     """
-    Discover available SURVEYR values in the CKAN DataStore resource.
+    Discover available SURVEYR values in the DataStore resource.
 
-    Primary method: datastore_search_sql with DISTINCT (fast, minimal transfer).
-    Fallback method: paged datastore_search of SURVEYR only.
-
-    Returns:
-        Sorted list of int years.
+    Preferred: SQL DISTINCT (fast).
+    Fallback: paged datastore_search for SURVEYR only.
     """
     rid = (resource_id or _resolve_resource_id()).strip()
 
-    # 1) Preferred: SQL DISTINCT
+    # Preferred: SQL DISTINCT
     try:
         sql = f'SELECT DISTINCT "SURVEYR" AS year FROM "{rid}" WHERE "SURVEYR" IS NOT NULL ORDER BY "SURVEYR"'
         records = _datastore_search_sql(sql=sql, timeout_seconds=timeout_seconds)
@@ -263,15 +256,13 @@ def get_available_survey_years(
         if years:
             return years
     except Exception:
-        # fall through to search-based method
         pass
 
-    # 2) Fallback: scan SURVEYR field only (still potentially heavier)
+    # Fallback scan (fields=["SURVEYR"]) with no totals
     years_set: Set[int] = set()
     offset = 0
     page = 10_000
 
-    # We keep include_total=False here to avoid expensive counts on big tables.
     while True:
         resp = _datastore_search(
             resource_id=rid,
@@ -296,14 +287,9 @@ def get_available_survey_years(
                 continue
 
         offset += len(resp.records)
-
-        # If we got less than requested, likely end of table
         if len(resp.records) < page:
             break
-
-        # Safety stop: if we already found a reasonable number of years, stop early
-        # (PSES should be a small set of cycle years).
-        if len(years_set) >= 20:
+        if len(years_set) >= 25:
             break
 
     return sorted(years_set)
@@ -318,19 +304,17 @@ def query_pses_results(
     page_size: int = 5_000,
     resource_id: Optional[str] = None,
     timeout_seconds: int = 90,
-    include_total: bool = True,
+    include_total: bool = False,
 ) -> pd.DataFrame:
     """
-    Fetch a slice of PSES results from CKAN DataStore, using pagination.
+    Fetch a slice from CKAN datastore_search with pagination.
 
-    Important:
-      - Preserve DEMCODE="" when you want “no breakdown”.
-      - This does not aggregate (data is already aggregated).
+    - No aggregation is performed.
+    - include_total defaults to False (better for large tables).
     """
     rid = (resource_id or _resolve_resource_id()).strip()
 
-    # Keep per-request limit in a range that CKAN tends to handle reliably.
-    page_limit = int(max(500, min(int(page_size), 10_000)))
+    page_limit = int(max(200, min(int(page_size), 10_000)))
 
     all_records: List[Dict[str, Any]] = []
     offset = 0
@@ -354,7 +338,7 @@ def query_pses_results(
             timeout_seconds=timeout_seconds,
             max_retries=4,
             backoff_seconds=1.0,
-            adaptive_limit_floor=500,
+            adaptive_limit_floor=200,
         )
 
         if include_total and total is None:
@@ -376,3 +360,51 @@ def query_pses_results(
         return pd.DataFrame()
 
     return pd.DataFrame.from_records(all_records)
+
+
+def query_pses_results_overall_sql(
+    *,
+    question_code: str,
+    survey_year: int,
+    org_levels: Dict[str, int],
+    fields: Optional[List[str]] = None,
+    resource_id: Optional[str] = None,
+    timeout_seconds: int = 90,
+) -> pd.DataFrame:
+    """
+    Special-case query for OVERALL (no breakdown) rows when DEMCODE may be NULL or ''.
+
+    Uses datastore_search_sql:
+      WHERE QUESTION = 'Q08'
+        AND SURVEYR = 2018
+        AND LEVEL1ID..LEVEL5ID = ...
+        AND (DEMCODE IS NULL OR DEMCODE = '')
+
+    No aggregation. Returns rows as-is.
+    """
+    rid = (resource_id or _resolve_resource_id()).strip()
+
+    q = str(question_code).strip().replace("'", "''")
+    year = int(survey_year)
+
+    where_parts = [
+        f"\"QUESTION\" = '{q}'",
+        f"\"SURVEYR\" = {year}",
+        "(\"DEMCODE\" IS NULL OR \"DEMCODE\" = '')",
+    ]
+
+    for col, val in org_levels.items():
+        if col in ("LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"):
+            where_parts.append(f"\"{col}\" = {int(val)}")
+
+    cols = "*"
+    if fields:
+        safe_cols = [f"\"{c}\"" for c in fields]
+        cols = ", ".join(safe_cols)
+
+    sql = f"SELECT {cols} FROM \"{rid}\" WHERE " + " AND ".join(where_parts)
+
+    records = _datastore_search_sql(sql=sql, timeout_seconds=timeout_seconds)
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame.from_records(records)
