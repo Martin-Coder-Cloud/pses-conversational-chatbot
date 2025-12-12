@@ -1,3 +1,4 @@
+# src/pses_chatbot/core/data_loader.py
 from __future__ import annotations
 
 import json
@@ -33,32 +34,33 @@ def _get_config_value(*names: str, default: Any = None) -> Any:
 
 
 def _resolve_ckan_search_url() -> str:
-    # Prefer existing config names, but default to the canonical CKAN endpoint.
-    return str(
-        _get_config_value(
-            "CKAN_DATASTORE_SEARCH_URL",
-            "DATASTORE_SEARCH_URL",
-            "CKAN_SEARCH_URL",
-            "CKAN_API_DATASTORE_SEARCH_URL",
-            default="https://open.canada.ca/data/en/api/3/action/datastore_search",
-        )
+    # Your config already defines CKAN_DATASTORE_SEARCH_URL; we honor it.
+    url = _get_config_value(
+        "CKAN_DATASTORE_SEARCH_URL",
+        "DATASTORE_SEARCH_URL",
+        "CKAN_SEARCH_URL",
+        "CKAN_API_DATASTORE_SEARCH_URL",
+        default="https://open.canada.ca/data/en/api/3/action/datastore_search",
     )
+    return str(url).strip()
 
 
 def _resolve_resource_id() -> str:
+    # IMPORTANT: your config uses PSES_DATASTORE_RESOURCE_ID (primary)
     rid = _get_config_value(
-        # common names people use
+        "PSES_DATASTORE_RESOURCE_ID",  # <-- your config
+        # fallbacks / legacy aliases
         "PSES_RESOURCE_ID",
         "CKAN_RESOURCE_ID",
         "DATASTORE_RESOURCE_ID",
         "RESOURCE_ID",
-        # if you stored it under a nested config object/dict, adjust later
         default=None,
     )
     if rid is None or str(rid).strip() == "":
         raise DataLoaderError(
-            "Missing CKAN resource id in config.py. "
-            "Expected one of: PSES_RESOURCE_ID, CKAN_RESOURCE_ID, DATASTORE_RESOURCE_ID, RESOURCE_ID."
+            "Missing CKAN resource id in config.py. Expected one of: "
+            "PSES_DATASTORE_RESOURCE_ID, PSES_RESOURCE_ID, CKAN_RESOURCE_ID, "
+            "DATASTORE_RESOURCE_ID, RESOURCE_ID."
         )
     return str(rid).strip()
 
@@ -69,8 +71,8 @@ CKAN_DATASTORE_SEARCH_URL = _resolve_ckan_search_url()
 def _clean_filters(filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     CKAN datastore_search expects a JSON object for `filters`.
-    We preserve empty-string values intentionally (e.g., DEMCODE="").
-    We remove only keys whose value is None.
+    Preserve empty-string values intentionally (e.g., DEMCODE="").
+    Remove only keys whose value is None.
     """
     if not filters:
         return None
@@ -87,7 +89,7 @@ def _session() -> requests.Session:
     s.headers.update(
         {
             "Accept": "application/json",
-            "User-Agent": "pses-conversational-chatbot/1.0",
+            "User-Agent": "pses-conversational-chatbot/0.1.0",
         }
     )
     return s
@@ -203,6 +205,7 @@ def query_pses_results(
     """
     rid = (resource_id or _resolve_resource_id()).strip()
 
+    # Keep per-request limit in a range that CKAN tends to handle reliably.
     page_limit = int(max(500, min(int(page_size), 10_000)))
 
     all_records: List[Dict[str, Any]] = []
@@ -230,8 +233,8 @@ def query_pses_results(
             adaptive_limit_floor=500,
         )
 
-        if total is None:
-            total = page.total if include_total else None
+        if include_total and total is None:
+            total = page.total
 
         if not page.records:
             break
@@ -239,7 +242,7 @@ def query_pses_results(
         all_records.extend(page.records)
         offset += len(page.records)
 
-        if total is not None and offset >= total:
+        if include_total and total is not None and offset >= total:
             break
 
         if len(page.records) < limit:
