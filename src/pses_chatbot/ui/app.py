@@ -7,7 +7,10 @@ import pandas as pd
 import streamlit as st
 
 from pses_chatbot.config import APP_NAME, APP_VERSION
-from pses_chatbot.core.data_loader import query_pses_results
+from pses_chatbot.core.data_loader import (
+    query_pses_results,
+    get_available_survey_years,
+)
 from pses_chatbot.core.metadata_loader import (
     load_questions_meta,
     load_scales_meta,
@@ -25,7 +28,6 @@ from pses_chatbot.core.audit import build_audit_snapshot
 
 LEVEL_COLS = ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]
 
-# Org metadata columns as actually returned by load_org_meta() (per your diagnostic)
 ORG_LABEL_EN_COL = "org_name_en"
 ORG_LABEL_FR_COL = "org_name_fr"
 ORG_DEPT_CODE_COL = "dept_code"
@@ -33,8 +35,13 @@ ORG_UNITID_COL = "UNITID"
 
 
 # ---------------------------------------------------------------------
-# Utilities
+# Cached “dataset domain” discovery
 # ---------------------------------------------------------------------
+
+@st.cache_data(ttl=6 * 60 * 60)  # 6 hours
+def _cached_available_years() -> List[int]:
+    return get_available_survey_years()
+
 
 def _normalize_text(x: Any) -> str:
     if x is None:
@@ -57,17 +64,12 @@ def _coerce_int_series(df: pd.DataFrame, col: str) -> None:
 
 def _coerce_org_df(org_df: pd.DataFrame) -> pd.DataFrame:
     df = org_df.copy()
-
-    # numeric cols
     for c in LEVEL_COLS:
         _coerce_int_series(df, c)
     _coerce_int_series(df, ORG_UNITID_COL)
-
-    # text cols
     for c in [ORG_LABEL_EN_COL, ORG_LABEL_FR_COL, ORG_DEPT_CODE_COL]:
         if c in df.columns:
             df[c] = df[c].apply(_normalize_text)
-
     return df
 
 
@@ -77,11 +79,7 @@ def _label_org_row(row: pd.Series, lang: str = "EN", show_ids: bool = True) -> s
     dept = _normalize_text(row.get(ORG_DEPT_CODE_COL, ""))
     unitid = int(row.get(ORG_UNITID_COL, 0)) if ORG_UNITID_COL in row.index else 0
 
-    if lang.upper() == "FR":
-        name = fr or en
-    else:
-        name = en or fr
-
+    name = (fr or en) if lang.upper() == "FR" else (en or fr)
     if not name:
         name = "Unit"
 
@@ -95,47 +93,29 @@ def _label_org_row(row: pd.Series, lang: str = "EN", show_ids: bool = True) -> s
 
 
 def _level_candidates(df: pd.DataFrame, level_idx: int, selected: Dict[str, int]) -> pd.DataFrame:
-    """
-    Candidate rows for selecting LEVEL{level_idx+1} under a selected parent.
-
-    Pattern used:
-      - prior levels must match the selected path
-      - current level must be > 0 (real unit, not roll-up)
-      - deeper levels must be == 0 (roll-up node at this depth)
-    """
     work = df.copy()
 
-    # prior levels fixed
     for i in range(level_idx):
         col = LEVEL_COLS[i]
-        if col in work.columns:
-            work = work[work[col] == int(selected.get(col, 0))]
+        work = work[work[col] == int(selected.get(col, 0))]
 
-    # current level > 0
     cur_col = LEVEL_COLS[level_idx]
-    if cur_col in work.columns:
-        work = work[work[cur_col] > 0]
+    work = work[work[cur_col] > 0]
 
-    # deeper levels == 0
     for j in range(level_idx + 1, len(LEVEL_COLS)):
         dcol = LEVEL_COLS[j]
-        if dcol in work.columns:
-            work = work[work[dcol] == 0]
+        work = work[work[dcol] == 0]
 
-    sort_cols = [cur_col] if cur_col in work.columns else []
+    sort_cols = [cur_col]
     if ORG_UNITID_COL in work.columns:
         sort_cols.append(ORG_UNITID_COL)
-    if sort_cols:
-        work = work.sort_values(sort_cols)
-
-    return work
+    return work.sort_values(sort_cols)
 
 
 def _find_rollup_name(df: pd.DataFrame, selected: Dict[str, int], lang: str) -> str:
     work = df.copy()
     for c in LEVEL_COLS:
-        if c in work.columns:
-            work = work[work[c] == int(selected.get(c, 0))]
+        work = work[work[c] == int(selected.get(c, 0))]
     if work.empty:
         ids = ".".join(str(selected.get(c, 0)) for c in LEVEL_COLS)
         return f"(IDs {ids})"
@@ -143,35 +123,25 @@ def _find_rollup_name(df: pd.DataFrame, selected: Dict[str, int], lang: str) -> 
 
 
 def render_org_cascade(org_df_raw: pd.DataFrame, lang: str = "EN") -> Dict[str, int]:
-    """
-    Cascading dropdowns for LEVEL1ID..LEVEL5ID using org_name_en/org_name_fr labels.
-
-    Returns dict with all five levels. Selecting 0 at any level stops deeper selection.
-    """
     if org_df_raw is None or len(org_df_raw) == 0:
-        st.warning("Org metadata is empty; defaulting org levels to PS-wide (all zeros).")
+        st.warning("Org metadata is empty; defaulting to PS-wide (LEVEL1–5 = 0).")
         return {c: 0 for c in LEVEL_COLS}
 
     df = _coerce_org_df(org_df_raw)
 
-    # Validate required columns exist
     required = set(LEVEL_COLS + [ORG_LABEL_EN_COL, ORG_LABEL_FR_COL])
     missing = [c for c in required if c not in df.columns]
     if missing:
-        st.error(f"Org metadata is missing required columns: {missing}")
+        st.error(f"Org metadata missing required columns: {missing}")
         return {c: 0 for c in LEVEL_COLS}
 
     sel: Dict[str, int] = {c: 0 for c in LEVEL_COLS}
 
-    # LEVEL1 options: rows where LEVEL2-5 == 0
+    # Level1 choices: LEVEL2-5 all zero
     lvl1 = df.copy()
     for c in LEVEL_COLS[1:]:
         lvl1 = lvl1[lvl1[c] == 0]
-
-    sort_cols = ["LEVEL1ID"]
-    if ORG_UNITID_COL in lvl1.columns:
-        sort_cols.append(ORG_UNITID_COL)
-    lvl1 = lvl1.sort_values(sort_cols)
+    lvl1 = lvl1.sort_values(["LEVEL1ID"])
 
     lvl1_map: Dict[int, str] = {0: "Public Service-wide (roll-up) — LEVEL1ID=0"}
     for _, row in lvl1.iterrows():
@@ -192,28 +162,25 @@ def render_org_cascade(org_df_raw: pd.DataFrame, lang: str = "EN") -> Dict[str, 
     if sel["LEVEL1ID"] == 0:
         return sel
 
-    # LEVEL2..LEVEL5
     for level_idx in range(1, 5):
         col = LEVEL_COLS[level_idx]
 
-        # Name for roll-up label: set this level+deeper to 0 to refer to roll-up node
         parent_for_label = {**sel}
         for deeper in LEVEL_COLS[level_idx:]:
             parent_for_label[deeper] = 0
 
-        parent_name = _find_rollup_name(df, parent_for_label, lang=lang)
-        rollup_label = f"All respondents (roll-up at {col}=0) — {parent_name}"
+        rollup_name = _find_rollup_name(df, parent_for_label, lang=lang)
+        rollup_label = f"All respondents (roll-up at {col}=0) — {rollup_name}"
 
         candidates = _level_candidates(df, level_idx=level_idx, selected=sel)
 
         options_map: Dict[int, str] = {0: rollup_label}
-        if not candidates.empty and col in candidates.columns:
-            for _, row in candidates.iterrows():
-                lv = int(row.get(col, 0))
-                if lv <= 0:
-                    continue
-                if lv not in options_map:
-                    options_map[lv] = _label_org_row(row, lang=lang)
+        for _, row in candidates.iterrows():
+            lv = int(row.get(col, 0))
+            if lv <= 0:
+                continue
+            if lv not in options_map:
+                options_map[lv] = _label_org_row(row, lang=lang)
 
         if len(options_map) == 1:
             sel[col] = 0
@@ -230,7 +197,6 @@ def render_org_cascade(org_df_raw: pd.DataFrame, lang: str = "EN") -> Dict[str, 
         if sel[col] == 0:
             break
 
-        # Force deeper levels to 0 unless explicitly selected later
         for deeper in LEVEL_COLS[level_idx + 1:]:
             sel[deeper] = 0
 
@@ -248,16 +214,17 @@ def _render_chat_area() -> None:
 
 def _render_backend_status() -> None:
     with st.expander("Backend status (developer view)", expanded=False):
-        st.write("Quick connectivity test to the CKAN DataStore.")
-        if st.button("Run test query (max 1,000 rows)"):
+        if st.button("Run test query (max 200 rows)"):
             try:
                 with st.spinner("Querying PSES DataStore..."):
                     df = query_pses_results(
                         filters=None,
                         fields=None,
                         sort=None,
-                        max_rows=1_000,
-                        page_size=1_000,
+                        max_rows=200,
+                        page_size=200,
+                        timeout_seconds=90,
+                        include_total=False,
                     )
                 st.success("PSES DataStore query succeeded.")
                 st.write(f"Returned: {df.shape[0]} rows × {df.shape[1]} columns")
@@ -271,23 +238,15 @@ def _render_backend_status() -> None:
 
 def _render_metadata_status() -> None:
     with st.expander("Metadata status (developer view)", expanded=True):
-        st.write(
-            "This panel loads metadata from the Excel workbook and shows counts plus a diagnostic preview.\n"
-            "Org metadata preview uses the post-loader schema (org_name_en/org_name_fr/dept_code)."
-        )
-
-        colA, colB, colC = st.columns([1, 1, 2])
+        colA, colB = st.columns([1, 2])
         with colA:
             refresh = st.checkbox("Force refresh metadata loaders", value=True)
         with colB:
-            preview_rows = st.number_input("Preview rows", min_value=5, max_value=200, value=25, step=5)
-        with colC:
-            level_path_str = st.text_input(
-                "Org lookup test (LEVEL1ID..LEVEL5ID), e.g. 1,0,0,0,0:",
-                value="1,0,0,0,0",
-            )
+            if st.button("Refresh cached available years"):
+                _cached_available_years.clear()
+                st.success("Cleared cached available years.")
 
-        if st.button("Load metadata and show summary + diagnostics"):
+        if st.button("Load metadata and show summary"):
             try:
                 with st.spinner("Loading questions..."):
                     q = load_questions_meta(refresh=bool(refresh))
@@ -296,112 +255,46 @@ def _render_metadata_status() -> None:
                 with st.spinner("Loading demographics..."):
                     d = load_demographics_meta(refresh=bool(refresh))
                 with st.spinner("Loading org hierarchy..."):
-                    o_raw = load_org_meta(refresh=bool(refresh))
+                    o = load_org_meta(refresh=bool(refresh))
                 with st.spinner("Loading pos/neg/agree..."):
                     p = load_posneg_meta(refresh=bool(refresh))
 
                 st.success("Metadata loaded successfully.")
-
-                st.write("Counts")
                 st.write(f"Questions: {len(q)}")
                 st.write(f"Scales: {len(s)}")
                 st.write(f"Demographics: {len(d)}")
-                st.write(f"Org rows: {len(o_raw)}")
+                st.write(f"Org rows: {len(o)}")
                 st.write(f"Pos/Neg mappings: {len(p)}")
 
-                st.write("---")
-                st.write("Organization metadata diagnostics")
-
-                if o_raw is None or len(o_raw) == 0:
-                    st.warning("Org metadata dataframe is empty.")
-                    return
-
-                st.write("Org columns (as loaded)")
-                st.write(list(o_raw.columns))
-
-                st.write("Org columns (repr view — reveals hidden spaces/characters)")
-                st.write([repr(c) for c in list(o_raw.columns)])
-
-                # Preview key columns that actually exist
-                preferred = [
-                    "LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID",
-                    ORG_UNITID_COL,
-                    ORG_LABEL_EN_COL, ORG_LABEL_FR_COL, ORG_DEPT_CODE_COL,
-                ]
-                available = [c for c in preferred if c in o_raw.columns]
-                if not available:
-                    st.error("No expected org columns found. Check loader output.")
-                    return
-
-                st.write("Org preview (key columns)")
-                st.dataframe(o_raw[available].head(int(preview_rows)), use_container_width=True)
-
-                # Lookup test
-                st.write("---")
-                st.write("Org lookup test: filter by LEVEL1ID..LEVEL5ID")
-
-                levels: List[int] = []
-                try:
-                    parts = [p.strip() for p in level_path_str.split(",")]
-                    levels = [int(x) for x in parts if x != ""]
-                except Exception:
-                    levels = []
-
-                if len(levels) != 5:
-                    st.warning("Please enter exactly 5 integers (example: 1,0,0,0,0).")
-                    return
-
-                needed_cols = LEVEL_COLS
-                if not all(c in o_raw.columns for c in needed_cols):
-                    st.error(
-                        "Cannot run LEVEL filter because one or more LEVEL columns are missing. "
-                        "Check the column list above."
-                    )
-                    return
-
-                o = _coerce_org_df(o_raw)
-
-                mask = (
-                    (o["LEVEL1ID"] == levels[0]) &
-                    (o["LEVEL2ID"] == levels[1]) &
-                    (o["LEVEL3ID"] == levels[2]) &
-                    (o["LEVEL4ID"] == levels[3]) &
-                    (o["LEVEL5ID"] == levels[4])
-                )
-                matches = o[mask]
-
-                st.write(f"Matches found: {len(matches)} for LEVEL path = {levels}")
-
-                show_cols = [c for c in preferred if c in o.columns]
-                if len(matches) == 0:
-                    st.warning("No matching org rows found for that LEVEL path.")
-                else:
-                    st.dataframe(matches[show_cols].head(100), use_container_width=True)
-                    if ORG_LABEL_EN_COL in matches.columns:
-                        blanks = (matches[ORG_LABEL_EN_COL].astype(str).str.strip() == "").sum()
-                        st.write(f"org_name_en blanks among matches: {blanks} / {len(matches)}")
+                # Show available years (cached discovery)
+                years = _cached_available_years()
+                st.write(f"Available survey years in DataStore (cached): {years}")
 
             except Exception as e:
-                st.error("Error while loading metadata or running diagnostics.")
+                st.error("Error while loading metadata.")
                 st.code(repr(e))
                 st.text_area("Traceback", value=traceback.format_exc(), height=260)
 
 
 def _render_analytical_query_tester() -> None:
     with st.expander("Analytical query test (developer view)", expanded=True):
-        st.write("Runs the analytical query engine and shows audit facts.")
+        available_years = _cached_available_years()
 
         col1, col2 = st.columns(2)
 
         with col1:
             question_code = st.text_input("Question code (QUESTION, e.g. Q08):", value="Q08")
+
+            # Default is “all available years”
+            default_years_str = ",".join(str(y) for y in available_years) if available_years else ""
             years_str = st.text_input(
-                "Survey years (comma-separated, e.g. 2019,2020,2021,2022,2023,2024):",
-                value="2019,2020,2021,2022,2023,2024",
+                "Survey years (comma-separated). Default = all available years:",
+                value=default_years_str,
             )
+
             demcode_input = st.text_input(
                 'DEMCODE (leave blank for overall/no breakdown = empty string ""):',
-                value="",
+                value="",  # default: no demo
             )
 
         with col2:
@@ -410,24 +303,41 @@ def _render_analytical_query_tester() -> None:
             except Exception:
                 org_raw = pd.DataFrame()
 
-            st.write("Organization (cascading selection):")
+            st.write("Organization (default PS-wide unless you select otherwise):")
             org_levels = render_org_cascade(org_raw, lang="EN")
 
         if st.button("Run analytical query", key="run_analytical_query_btn"):
             try:
+                # Parse years from input; if blank, use all available
                 years: List[int] = []
-                for part in years_str.split(","):
-                    p = part.strip()
-                    if p:
-                        years.append(int(p))
-                if not years:
-                    st.error("Please specify at least one survey year.")
-                    return
+                if years_str.strip():
+                    for part in years_str.split(","):
+                        p = part.strip()
+                        if p:
+                            years.append(int(p))
+                else:
+                    years = list(available_years)
 
+                if not years:
+                    raise QueryEngineError(
+                        f"No survey years specified and none discovered. Available years: {available_years}"
+                    )
+
+                # Validate years against discovered domain
+                valid = [y for y in years if y in set(available_years)]
+                invalid = [y for y in years if y not in set(available_years)]
+                if invalid:
+                    st.warning(f"Ignoring years not present in dataset: {sorted(invalid)}. Using: {sorted(valid)}.")
+                if not valid:
+                    raise QueryEngineError(
+                        f"None of the requested years exist in dataset. Available years: {available_years}"
+                    )
+
+                # Default PS-wide is all zeros; default no demo is empty string.
                 params = QueryParameters(
-                    survey_years=years,
+                    survey_years=sorted(valid),
                     question_code=question_code.strip(),
-                    demcode=demcode_input,  # may be ""
+                    demcode=demcode_input,  # empty string means “overall”
                     org_levels=org_levels,
                 )
 
@@ -438,7 +348,7 @@ def _render_analytical_query_tester() -> None:
                 st.success("Analytical query succeeded.")
                 st.write(f"Question: {snapshot.question_code} — {snapshot.question_label_en}")
                 st.write(f"Organization: {snapshot.org_label_en or '(label not found)'}")
-                st.write(f"Demographic: {snapshot.dem_label_en or 'Overall (all respondents)'}")
+                st.write(f"Demographic: {snapshot.dem_label_en or 'Overall (no breakdown)'}")
                 st.write(f"Metric: {snapshot.metric_name_en}")
 
                 rows = []
