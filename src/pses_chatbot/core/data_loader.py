@@ -1,10 +1,9 @@
-# src/pses_chatbot/core/data_loader.py
 from __future__ import annotations
 
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 import requests
@@ -23,54 +22,45 @@ class DataStoreResponse:
     fields: Optional[List[Dict[str, Any]]] = None
 
 
-def _get_config_value(*names: str, default: Any = None) -> Any:
-    """
-    Return the first attribute found in pses_chatbot.config among `names`.
-    """
-    for n in names:
-        if hasattr(cfg, n):
-            return getattr(cfg, n)
-    return default
-
-
 def _resolve_ckan_search_url() -> str:
-    # Your config already defines CKAN_DATASTORE_SEARCH_URL; we honor it.
-    url = _get_config_value(
-        "CKAN_DATASTORE_SEARCH_URL",
-        "DATASTORE_SEARCH_URL",
-        "CKAN_SEARCH_URL",
-        "CKAN_API_DATASTORE_SEARCH_URL",
-        default="https://open.canada.ca/data/en/api/3/action/datastore_search",
-    )
-    return str(url).strip()
+    url = getattr(cfg, "CKAN_DATASTORE_SEARCH_URL", "").strip()
+    if not url:
+        return "https://open.canada.ca/data/en/api/3/action/datastore_search"
+    return url
+
+
+def _resolve_ckan_sql_url() -> str:
+    """
+    Prefer CKAN_BASE_URL if available, otherwise derive from CKAN_DATASTORE_SEARCH_URL.
+    """
+    base = getattr(cfg, "CKAN_BASE_URL", "").strip()
+    if base:
+        return f"{base}/datastore_search_sql"
+
+    # Derive from .../datastore_search
+    search = _resolve_ckan_search_url()
+    if search.endswith("/datastore_search"):
+        return search[:-len("/datastore_search")] + "/datastore_search_sql"
+    return "https://open.canada.ca/data/en/api/3/action/datastore_search_sql"
 
 
 def _resolve_resource_id() -> str:
-    # IMPORTANT: your config uses PSES_DATASTORE_RESOURCE_ID (primary)
-    rid = _get_config_value(
-        "PSES_DATASTORE_RESOURCE_ID",  # <-- your config
-        # fallbacks / legacy aliases
-        "PSES_RESOURCE_ID",
-        "CKAN_RESOURCE_ID",
-        "DATASTORE_RESOURCE_ID",
-        "RESOURCE_ID",
-        default=None,
-    )
-    if rid is None or str(rid).strip() == "":
+    rid = getattr(cfg, "PSES_DATASTORE_RESOURCE_ID", "").strip()
+    if not rid:
         raise DataLoaderError(
-            "Missing CKAN resource id in config.py. Expected one of: "
-            "PSES_DATASTORE_RESOURCE_ID, PSES_RESOURCE_ID, CKAN_RESOURCE_ID, "
-            "DATASTORE_RESOURCE_ID, RESOURCE_ID."
+            "Missing CKAN resource id in config.py. Expected: PSES_DATASTORE_RESOURCE_ID"
         )
-    return str(rid).strip()
+    return rid
 
 
 CKAN_DATASTORE_SEARCH_URL = _resolve_ckan_search_url()
+CKAN_DATASTORE_SEARCH_SQL_URL = _resolve_ckan_sql_url()
 
 
 def _clean_filters(filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     CKAN datastore_search expects a JSON object for `filters`.
+
     Preserve empty-string values intentionally (e.g., DEMCODE="").
     Remove only keys whose value is None.
     """
@@ -183,6 +173,140 @@ def _datastore_search(
             sess.close()
         except Exception:
             pass
+
+
+def _datastore_search_sql(
+    *,
+    sql: str,
+    timeout_seconds: int = 90,
+    max_retries: int = 4,
+    backoff_seconds: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """
+    Calls CKAN datastore_search_sql with retries.
+    Returns `records` list.
+    """
+    sess = _session()
+    params = {"sql": sql}
+
+    attempt = 0
+    try:
+        while True:
+            attempt += 1
+            try:
+                resp = sess.get(CKAN_DATASTORE_SEARCH_SQL_URL, params=params, timeout=timeout_seconds)
+                resp.raise_for_status()
+                payload = resp.json()
+                if not isinstance(payload, dict) or not payload.get("success", False):
+                    raise DataLoaderError(f"CKAN datastore_search_sql returned success=false: {payload}")
+                result = payload.get("result", {}) or {}
+                records = result.get("records", []) or []
+                return records
+
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
+                if attempt > max_retries:
+                    raise DataLoaderError(
+                        f"HTTP timeout calling datastore_search_sql after {max_retries} retries: {exc}"
+                    ) from exc
+                time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+                continue
+
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if status in (429, 500, 502, 503, 504) and attempt <= max_retries:
+                    time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+                    continue
+                raise DataLoaderError(f"HTTP error while calling datastore_search_sql: {exc}") from exc
+
+            except requests.exceptions.RequestException as exc:
+                if attempt <= max_retries:
+                    time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+                    continue
+                raise DataLoaderError(f"Network error while calling datastore_search_sql: {exc}") from exc
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
+def get_available_survey_years(
+    *,
+    resource_id: Optional[str] = None,
+    timeout_seconds: int = 90,
+) -> List[int]:
+    """
+    Discover available SURVEYR values in the CKAN DataStore resource.
+
+    Primary method: datastore_search_sql with DISTINCT (fast, minimal transfer).
+    Fallback method: paged datastore_search of SURVEYR only.
+
+    Returns:
+        Sorted list of int years.
+    """
+    rid = (resource_id or _resolve_resource_id()).strip()
+
+    # 1) Preferred: SQL DISTINCT
+    try:
+        sql = f'SELECT DISTINCT "SURVEYR" AS year FROM "{rid}" WHERE "SURVEYR" IS NOT NULL ORDER BY "SURVEYR"'
+        records = _datastore_search_sql(sql=sql, timeout_seconds=timeout_seconds)
+        years: List[int] = []
+        for r in records:
+            v = r.get("year", r.get("SURVEYR"))
+            if v is None:
+                continue
+            try:
+                years.append(int(v))
+            except Exception:
+                continue
+        years = sorted(set(years))
+        if years:
+            return years
+    except Exception:
+        # fall through to search-based method
+        pass
+
+    # 2) Fallback: scan SURVEYR field only (still potentially heavier)
+    years_set: Set[int] = set()
+    offset = 0
+    page = 10_000
+
+    # We keep include_total=False here to avoid expensive counts on big tables.
+    while True:
+        resp = _datastore_search(
+            resource_id=rid,
+            filters=None,
+            fields=["SURVEYR"],
+            sort=None,
+            offset=offset,
+            limit=page,
+            include_total=False,
+            timeout_seconds=timeout_seconds,
+        )
+        if not resp.records:
+            break
+
+        for r in resp.records:
+            v = r.get("SURVEYR")
+            if v is None:
+                continue
+            try:
+                years_set.add(int(v))
+            except Exception:
+                continue
+
+        offset += len(resp.records)
+
+        # If we got less than requested, likely end of table
+        if len(resp.records) < page:
+            break
+
+        # Safety stop: if we already found a reasonable number of years, stop early
+        # (PSES should be a small set of cycle years).
+        if len(years_set) >= 20:
+            break
+
+    return sorted(years_set)
 
 
 def query_pses_results(
