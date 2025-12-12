@@ -34,10 +34,6 @@ ORG_DEPT_CODE_COL = "dept_code"
 ORG_UNITID_COL = "UNITID"
 
 
-# ---------------------------------------------------------------------
-# Cached “dataset domain” discovery
-# ---------------------------------------------------------------------
-
 @st.cache_data(ttl=6 * 60 * 60)  # 6 hours
 def _cached_available_years() -> List[int]:
     return get_available_survey_years()
@@ -94,22 +90,15 @@ def _label_org_row(row: pd.Series, lang: str = "EN", show_ids: bool = True) -> s
 
 def _level_candidates(df: pd.DataFrame, level_idx: int, selected: Dict[str, int]) -> pd.DataFrame:
     work = df.copy()
-
     for i in range(level_idx):
         col = LEVEL_COLS[i]
         work = work[work[col] == int(selected.get(col, 0))]
-
     cur_col = LEVEL_COLS[level_idx]
     work = work[work[cur_col] > 0]
-
     for j in range(level_idx + 1, len(LEVEL_COLS)):
         dcol = LEVEL_COLS[j]
         work = work[work[dcol] == 0]
-
-    sort_cols = [cur_col]
-    if ORG_UNITID_COL in work.columns:
-        sort_cols.append(ORG_UNITID_COL)
-    return work.sort_values(sort_cols)
+    return work.sort_values([cur_col])
 
 
 def _find_rollup_name(df: pd.DataFrame, selected: Dict[str, int], lang: str) -> str:
@@ -137,7 +126,6 @@ def render_org_cascade(org_df_raw: pd.DataFrame, lang: str = "EN") -> Dict[str, 
 
     sel: Dict[str, int] = {c: 0 for c in LEVEL_COLS}
 
-    # Level1 choices: LEVEL2-5 all zero
     lvl1 = df.copy()
     for c in LEVEL_COLS[1:]:
         lvl1 = lvl1[lvl1[c] == 0]
@@ -203,10 +191,6 @@ def render_org_cascade(org_df_raw: pd.DataFrame, lang: str = "EN") -> Dict[str, 
     return sel
 
 
-# ---------------------------------------------------------------------
-# UI sections
-# ---------------------------------------------------------------------
-
 def _render_chat_area() -> None:
     st.subheader("Prototype chat area")
     st.write("Conversational engine not wired yet. Use the developer panels below.")
@@ -228,8 +212,6 @@ def _render_backend_status() -> None:
                     )
                 st.success("PSES DataStore query succeeded.")
                 st.write(f"Returned: {df.shape[0]} rows × {df.shape[1]} columns")
-                if df.shape[1] > 0:
-                    st.write("First columns:", list(df.columns)[:20])
             except Exception as e:
                 st.error("Error while querying the PSES DataStore.")
                 st.code(repr(e))
@@ -266,7 +248,6 @@ def _render_metadata_status() -> None:
                 st.write(f"Org rows: {len(o)}")
                 st.write(f"Pos/Neg mappings: {len(p)}")
 
-                # Show available years (cached discovery)
                 years = _cached_available_years()
                 st.write(f"Available survey years in DataStore (cached): {years}")
 
@@ -279,22 +260,19 @@ def _render_metadata_status() -> None:
 def _render_analytical_query_tester() -> None:
     with st.expander("Analytical query test (developer view)", expanded=True):
         available_years = _cached_available_years()
+        default_years_str = ",".join(str(y) for y in available_years) if available_years else ""
 
         col1, col2 = st.columns(2)
 
         with col1:
             question_code = st.text_input("Question code (QUESTION, e.g. Q08):", value="Q08")
-
-            # Default is “all available years”
-            default_years_str = ",".join(str(y) for y in available_years) if available_years else ""
             years_str = st.text_input(
                 "Survey years (comma-separated). Default = all available years:",
                 value=default_years_str,
             )
-
             demcode_input = st.text_input(
-                'DEMCODE (leave blank for overall/no breakdown = empty string ""):',
-                value="",  # default: no demo
+                "DEMCODE (leave blank for overall/no breakdown):",
+                value="",
             )
 
         with col2:
@@ -308,7 +286,6 @@ def _render_analytical_query_tester() -> None:
 
         if st.button("Run analytical query", key="run_analytical_query_btn"):
             try:
-                # Parse years from input; if blank, use all available
                 years: List[int] = []
                 if years_str.strip():
                     for part in years_str.split(","):
@@ -319,26 +296,17 @@ def _render_analytical_query_tester() -> None:
                     years = list(available_years)
 
                 if not years:
-                    raise QueryEngineError(
-                        f"No survey years specified and none discovered. Available years: {available_years}"
-                    )
+                    raise QueryEngineError(f"No survey years specified. Available years: {available_years}")
 
-                # Validate years against discovered domain
-                valid = [y for y in years if y in set(available_years)]
-                invalid = [y for y in years if y not in set(available_years)]
-                if invalid:
-                    st.warning(f"Ignoring years not present in dataset: {sorted(invalid)}. Using: {sorted(valid)}.")
-                if not valid:
-                    raise QueryEngineError(
-                        f"None of the requested years exist in dataset. Available years: {available_years}"
-                    )
+                # baseline DEMCODE: blank => None
+                demcode = demcode_input.strip()
+                demcode_value = None if demcode == "" else demcode
 
-                # Default PS-wide is all zeros; default no demo is empty string.
                 params = QueryParameters(
-                    survey_years=sorted(valid),
+                    survey_years=sorted(years),
                     question_code=question_code.strip(),
-                    demcode=demcode_input,  # empty string means “overall”
-                    org_levels=org_levels,
+                    demcode=demcode_value,
+                    org_levels=org_levels,  # default PS-wide is all zeros
                 )
 
                 with st.spinner("Running analytical query + audit snapshot..."):
