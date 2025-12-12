@@ -1,185 +1,247 @@
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any, Dict, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import pandas as pd
 import requests
 
-from pses_chatbot.config import PSES_DATASTORE_RESOURCE_ID
-
-logger = logging.getLogger(__name__)
-
-CKAN_DATASTORE_SEARCH_URL = (
-    "https://open.canada.ca/data/en/api/3/action/datastore_search"
-)
+from pses_chatbot.config import CKAN_DATASTORE_SEARCH_URL, PSES_RESOURCE_ID
 
 
 class DataLoaderError(Exception):
-    """Custom exception for DataStore query failures."""
+    """Raised when the CKAN datastore cannot be queried reliably."""
+
+
+@dataclass(frozen=True)
+class DataStoreResponse:
+    records: List[Dict[str, Any]]
+    total: int
+    fields: Optional[List[Dict[str, Any]]] = None
+
+
+def _clean_filters(filters: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    CKAN datastore_search expects a JSON object for `filters`.
+    We also preserve empty-string values (e.g., DEMCODE = "") intentionally.
+    We remove only keys whose value is None.
+    """
+    if not filters:
+        return None
+    out: Dict[str, Any] = {}
+    for k, v in filters.items():
+        if v is None:
+            continue
+        out[k] = v
+    return out if out else None
+
+
+def _session() -> requests.Session:
+    """
+    Build a session with sane defaults. We keep it simple (no urllib3 Retry object)
+    and implement retries ourselves so we can adapt page sizes on timeouts.
+    """
+    s = requests.Session()
+    # helpful headers; CKAN doesn't require them, but they can improve behavior
+    s.headers.update(
+        {
+            "Accept": "application/json",
+            "User-Agent": "pses-conversational-chatbot/1.0",
+        }
+    )
+    return s
 
 
 def _datastore_search(
+    *,
     resource_id: str,
     filters: Optional[Dict[str, Any]] = None,
     fields: Optional[List[str]] = None,
     sort: Optional[str] = None,
     offset: int = 0,
-    limit: int = 1000,
-) -> Dict[str, Any]:
+    limit: int = 5_000,
+    include_total: bool = True,
+    timeout_seconds: int = 90,
+    max_retries: int = 4,
+    backoff_seconds: float = 1.0,
+    adaptive_limit_floor: int = 500,
+) -> DataStoreResponse:
     """
-    Low-level wrapper around CKAN's datastore_search.
+    Calls CKAN datastore_search reliably.
 
-    IMPORTANT:
-      - CKAN expects 'filters' as a JSON-encoded string.
-      - If we pass a dict directly, requests will serialize it incorrectly
-        (e.g., filters=QUESTION&filters=DEMCODE...), causing 500 errors.
-
-    Parameters
-    ----------
-    resource_id : str
-        CKAN resource ID (PSES main table).
-    filters : dict, optional
-        Dict of equality filters, e.g. {"QUESTION": "Q08", "SURVEYR": 2024}.
-    fields : list[str], optional
-        Subset of columns to return.
-    sort : str, optional
-        Sort expression (CKAN style), e.g. "SURVEYR asc".
-    offset : int
-        Starting offset for paging.
-    limit : int
-        Max number of rows to return in this call.
-
-    Returns
-    -------
-    dict
-        The 'result' object from CKAN's JSON response.
+    Key behaviors:
+      - Sends filters as JSON object (CKAN-correct).
+      - Retries on timeouts / transient errors with exponential backoff.
+      - If a timeout occurs, automatically reduces `limit` and retries.
     """
+    sess = _session()
+
+    cleaned_filters = _clean_filters(filters)
+
+    # CKAN params
     params: Dict[str, Any] = {
         "resource_id": resource_id,
-        "offset": offset,
-        "limit": limit,
+        "offset": int(offset),
+        "limit": int(limit),
     }
-
-    # Correct handling of filters: must be JSON-encoded
-    if filters is not None:
-        params["filters"] = json.dumps(filters)
-
+    if cleaned_filters is not None:
+        params["filters"] = json.dumps(cleaned_filters, ensure_ascii=False)
     if fields:
-        # CKAN allows comma-separated list of field names
+        # CKAN supports "fields" as comma-separated list or repeated param.
+        # Use comma-separated for consistency.
         params["fields"] = ",".join(fields)
     if sort:
         params["sort"] = sort
+    if include_total:
+        params["include_total"] = "true"
 
-    logger.info(
-        "Calling CKAN datastore_search with params (offset=%s, limit=%s, filters=%s)",
-        offset,
-        limit,
-        filters,
-    )
+    attempt = 0
+    cur_limit = int(limit)
 
-    try:
-        resp = requests.get(CKAN_DATASTORE_SEARCH_URL, params=params, timeout=30)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        logger.error("HTTP error while calling datastore_search: %s", exc)
-        raise DataLoaderError(f"HTTP error while calling datastore_search: {exc}") from exc
+    while True:
+        attempt += 1
+        params["limit"] = cur_limit
 
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        logger.error("Invalid JSON from datastore_search: %s", exc)
-        raise DataLoaderError(f"Invalid JSON from datastore_search: {exc}") from exc
+        try:
+            resp = sess.get(CKAN_DATASTORE_SEARCH_URL, params=params, timeout=timeout_seconds)
+            resp.raise_for_status()
+            payload = resp.json()
 
-    if not payload.get("success", False):
-        logger.error("CKAN reported failure: %s", payload)
-        raise DataLoaderError(f"CKAN reported failure: {payload}")
+            if not isinstance(payload, dict) or not payload.get("success", False):
+                raise DataLoaderError(f"CKAN datastore_search returned success=false: {payload}")
 
-    result = payload.get("result", {})
-    return result
+            result = payload.get("result", {})
+            records = result.get("records", []) or []
+            total = int(result.get("total", len(records)) or 0)
+            fields_meta = result.get("fields")
+
+            return DataStoreResponse(records=records, total=total, fields=fields_meta)
+
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
+            # Timeout: reduce page size and retry
+            if attempt > max_retries:
+                raise DataLoaderError(
+                    f"HTTP timeout calling datastore_search after {max_retries} retries: {exc}"
+                ) from exc
+
+            # Adaptive paging: halve the limit down to a floor.
+            new_limit = max(adaptive_limit_floor, cur_limit // 2)
+            cur_limit = new_limit
+
+            sleep_for = backoff_seconds * (2 ** (attempt - 1))
+            time.sleep(sleep_for)
+            continue
+
+        except requests.exceptions.HTTPError as exc:
+            # CKAN sometimes throws 500/502 transiently
+            status = getattr(exc.response, "status_code", None)
+            if status in (429, 500, 502, 503, 504) and attempt <= max_retries:
+                # On server error, also reduce limit a bit (helps large queries)
+                cur_limit = max(adaptive_limit_floor, int(cur_limit * 0.7))
+                sleep_for = backoff_seconds * (2 ** (attempt - 1))
+                time.sleep(sleep_for)
+                continue
+
+            raise DataLoaderError(f"HTTP error while calling datastore_search: {exc}") from exc
+
+        except requests.exceptions.RequestException as exc:
+            # Other transient network issues
+            if attempt <= max_retries:
+                sleep_for = backoff_seconds * (2 ** (attempt - 1))
+                time.sleep(sleep_for)
+                continue
+            raise DataLoaderError(f"Network error while calling datastore_search: {exc}") from exc
+
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
 
 def query_pses_results(
-    resource_id: Optional[str] = None,
+    *,
     filters: Optional[Dict[str, Any]] = None,
     fields: Optional[List[str]] = None,
     sort: Optional[str] = None,
     max_rows: int = 50_000,
-    page_size: int = 10_000,
+    page_size: int = 5_000,
+    resource_id: Optional[str] = None,
+    timeout_seconds: int = 90,
 ) -> pd.DataFrame:
     """
-    Higher-level helper to fetch PSES records from the DataStore.
+    Fetch a slice of PSES results from CKAN DataStore, using pagination.
 
-    This function:
-      - Uses the configured PSES_DATASTORE_RESOURCE_ID by default.
-      - Applies equality filters if provided.
-      - Pages through the DataStore until:
-          * we have fetched 'max_rows' records, OR
-          * no more records are returned.
-      - Returns a pandas DataFrame (may be empty).
+    Notes:
+      - This is NOT aggregation: the datastore is already aggregated.
+      - We paginate and concatenate up to max_rows.
+      - Filters must include the required query keys at the call site
+        (SURVEYR, QUESTION, DEMCODE, LEVEL1ID..LEVEL5ID).
 
-    Parameters
-    ----------
-    resource_id : str, optional
-        CKAN resource ID. If None, uses PSES_DATASTORE_RESOURCE_ID from config.
-    filters : dict, optional
-        Dict of equality filters, e.g. {"QUESTION": "Q08", "SURVEYR": 2024}.
-    fields : list[str], optional
-        Limit returned columns to this subset.
-    sort : str, optional
-        CKAN sort expression, e.g. "SURVEYR asc".
-    max_rows : int
-        Hard cap on total rows to fetch.
-    page_size : int
-        Number of rows to request per call to datastore_search.
+    Args:
+      filters: CKAN filters dict (sent as JSON). Keep DEMCODE="" when overall.
+      fields: optional list of fields to return.
+      sort: optional CKAN sort string.
+      max_rows: hard cap to prevent loading too much.
+      page_size: requested per page; will be adaptively reduced on timeout.
+      resource_id: defaults to configured PSES_RESOURCE_ID.
+      timeout_seconds: per-request timeout.
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with the collected records.
+    Returns:
+      DataFrame of records (may be empty).
     """
-    if resource_id is None:
-        resource_id = PSES_DATASTORE_RESOURCE_ID
+    rid = resource_id or PSES_RESOURCE_ID
 
-    if not resource_id:
-        raise DataLoaderError("PSES_DATASTORE_RESOURCE_ID is not configured.")
-
-    if page_size <= 0:
-        raise ValueError("page_size must be positive.")
-    if max_rows <= 0:
-        raise ValueError("max_rows must be positive.")
+    # Keep page size reasonable; large limits can trigger slow responses.
+    # Your query_engine currently uses up to 50,000; that is often too big for CKAN reliably.
+    page_limit = int(max(500, min(page_size, 10_000)))
 
     all_records: List[Dict[str, Any]] = []
     offset = 0
+    total: Optional[int] = None
 
-    while len(all_records) < max_rows:
+    while True:
         remaining = max_rows - len(all_records)
-        page_limit = min(page_size, remaining)
+        if remaining <= 0:
+            break
 
-        result = _datastore_search(
-            resource_id=resource_id,
+        # Never request more than remaining rows
+        limit = min(page_limit, remaining)
+
+        page = _datastore_search(
+            resource_id=rid,
             filters=filters,
             fields=fields,
             sort=sort,
             offset=offset,
-            limit=page_limit,
+            limit=limit,
+            include_total=True,
+            timeout_seconds=timeout_seconds,
+            max_retries=4,
+            backoff_seconds=1.0,
+            adaptive_limit_floor=500,
         )
 
-        records = result.get("records", [])
-        if not records:
-            # No more data available
+        if total is None:
+            total = page.total
+
+        if not page.records:
             break
 
-        all_records.extend(records)
-        offset += len(records)
+        all_records.extend(page.records)
+        offset += len(page.records)
 
-        # If returned fewer than requested, we've hit the end
-        if len(records) < page_limit:
+        # Stop if we reached total (when CKAN provides it)
+        if total is not None and offset >= total:
+            break
+
+        # Safety stop: if CKAN returns fewer than requested, we may be at the end
+        if len(page.records) < limit:
             break
 
     if not all_records:
         return pd.DataFrame()
 
-    df = pd.DataFrame.from_records(all_records)
-    return df
+    return pd.DataFrame.from_records(all_records)
