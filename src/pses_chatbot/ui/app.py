@@ -33,10 +33,10 @@ ORG_LABEL_FR_COL = "org_name_fr"
 ORG_DEPT_CODE_COL = "dept_code"
 ORG_UNITID_COL = "UNITID"
 
-
-@st.cache_data(ttl=6 * 60 * 60)  # 6 hours
-def _cached_available_years() -> List[int]:
-    return get_available_survey_years()
+# IMPORTANT:
+# Default years are fixed to current known cycles in the dataset.
+# No automatic "discover years" is run on page load.
+DEFAULT_SURVEY_YEARS = [2018, 2019, 2020, 2022]
 
 
 def _normalize_text(x: Any) -> str:
@@ -212,21 +212,14 @@ def _render_backend_status() -> None:
                     )
                 st.success("PSES DataStore query succeeded.")
                 st.write(f"Returned: {df.shape[0]} rows × {df.shape[1]} columns")
-            except Exception as e:
+            except Exception:
                 st.error("Error while querying the PSES DataStore.")
-                st.code(repr(e))
                 st.text_area("Traceback", value=traceback.format_exc(), height=220)
 
 
 def _render_metadata_status() -> None:
     with st.expander("Metadata status (developer view)", expanded=True):
-        colA, colB = st.columns([1, 2])
-        with colA:
-            refresh = st.checkbox("Force refresh metadata loaders", value=True)
-        with colB:
-            if st.button("Refresh cached available years"):
-                _cached_available_years.clear()
-                st.success("Cleared cached available years.")
+        refresh = st.checkbox("Force refresh metadata loaders", value=True)
 
         if st.button("Load metadata and show summary"):
             try:
@@ -248,26 +241,33 @@ def _render_metadata_status() -> None:
                 st.write(f"Org rows: {len(o)}")
                 st.write(f"Pos/Neg mappings: {len(p)}")
 
-                years = _cached_available_years()
-                st.write(f"Available survey years in DataStore (cached): {years}")
+                st.write(f"Default survey years: {DEFAULT_SURVEY_YEARS}")
 
-            except Exception as e:
+            except Exception:
                 st.error("Error while loading metadata.")
-                st.code(repr(e))
                 st.text_area("Traceback", value=traceback.format_exc(), height=260)
+
+        # OPTIONAL manual action — never runs on page load
+        if st.button("Discover available survey years (fast SQL)"):
+            try:
+                with st.spinner("Discovering SURVEYR values via SQL (fast)..."):
+                    years = get_available_survey_years(timeout_seconds=15)
+                st.success(f"Discovered years: {years}")
+            except Exception as e:
+                st.warning("Year discovery failed (SQL may be slow/unavailable).")
+                st.code(repr(e))
 
 
 def _render_analytical_query_tester() -> None:
     with st.expander("Analytical query test (developer view)", expanded=True):
-        available_years = _cached_available_years()
-        default_years_str = ",".join(str(y) for y in available_years) if available_years else ""
+        default_years_str = ",".join(str(y) for y in DEFAULT_SURVEY_YEARS)
 
         col1, col2 = st.columns(2)
 
         with col1:
             question_code = st.text_input("Question code (QUESTION, e.g. Q08):", value="Q08")
             years_str = st.text_input(
-                "Survey years (comma-separated). Default = all available years:",
+                "Survey years (comma-separated). Default:",
                 value=default_years_str,
             )
             demcode_input = st.text_input(
@@ -293,12 +293,11 @@ def _render_analytical_query_tester() -> None:
                         if p:
                             years.append(int(p))
                 else:
-                    years = list(available_years)
+                    years = list(DEFAULT_SURVEY_YEARS)
 
                 if not years:
-                    raise QueryEngineError(f"No survey years specified. Available years: {available_years}")
+                    raise QueryEngineError("No survey years specified.")
 
-                # baseline DEMCODE: blank => None
                 demcode = demcode_input.strip()
                 demcode_value = None if demcode == "" else demcode
 
@@ -306,7 +305,7 @@ def _render_analytical_query_tester() -> None:
                     survey_years=sorted(years),
                     question_code=question_code.strip(),
                     demcode=demcode_value,
-                    org_levels=org_levels,  # default PS-wide is all zeros
+                    org_levels=org_levels,
                 )
 
                 with st.spinner("Running analytical query + audit snapshot..."):
@@ -336,9 +335,8 @@ def _render_analytical_query_tester() -> None:
 
             except QueryEngineError as qerr:
                 st.error(f"Analytical query failed: {qerr}")
-            except Exception as e:
+            except Exception:
                 st.error("Unexpected error while running analytical query.")
-                st.code(repr(e))
                 st.text_area("Traceback", value=traceback.format_exc(), height=280)
 
 
