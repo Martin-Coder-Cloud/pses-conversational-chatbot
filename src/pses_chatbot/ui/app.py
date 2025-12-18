@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import traceback
 from typing import Any, Dict, List
 
@@ -23,8 +24,10 @@ from pses_chatbot.core.query_engine import (
     run_analytical_query,
     QueryEngineError,
 )
-from pses_chatbot.core.audit import build_audit_snapshot
 
+# NOTE:
+# We intentionally do NOT import or call build_audit_snapshot here.
+# This file is for testing basic query functionality only (no audit layer).
 
 LEVEL_COLS = ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]
 
@@ -33,9 +36,7 @@ ORG_LABEL_FR_COL = "org_name_fr"
 ORG_DEPT_CODE_COL = "dept_code"
 ORG_UNITID_COL = "UNITID"
 
-# IMPORTANT:
-# Default years are fixed to current known cycles in the dataset.
-# No automatic "discover years" is run on page load.
+# Known current survey cycles in the datastore (can be updated later)
 DEFAULT_SURVEY_YEARS = [2018, 2019, 2020, 2022]
 
 
@@ -240,14 +241,13 @@ def _render_metadata_status() -> None:
                 st.write(f"Demographics: {len(d)}")
                 st.write(f"Org rows: {len(o)}")
                 st.write(f"Pos/Neg mappings: {len(p)}")
-
                 st.write(f"Default survey years: {DEFAULT_SURVEY_YEARS}")
 
             except Exception:
                 st.error("Error while loading metadata.")
                 st.text_area("Traceback", value=traceback.format_exc(), height=260)
 
-        # OPTIONAL manual action — never runs on page load
+        # Manual only — never runs automatically
         if st.button("Discover available survey years (fast SQL)"):
             try:
                 with st.spinner("Discovering SURVEYR values via SQL (fast)..."):
@@ -259,7 +259,7 @@ def _render_metadata_status() -> None:
 
 
 def _render_analytical_query_tester() -> None:
-    with st.expander("Analytical query test (developer view)", expanded=True):
+    with st.expander("Analytical query test (developer view) — BASIC (no audit)", expanded=True):
         default_years_str = ",".join(str(y) for y in DEFAULT_SURVEY_YEARS)
 
         col1, col2 = st.columns(2)
@@ -285,6 +285,9 @@ def _render_analytical_query_tester() -> None:
             org_levels = render_org_cascade(org_raw, lang="EN")
 
         if st.button("Run analytical query", key="run_analytical_query_btn"):
+            status = st.status("Preparing query…", expanded=True)
+            t0 = time.perf_counter()
+
             try:
                 years: List[int] = []
                 if years_str.strip():
@@ -308,15 +311,17 @@ def _render_analytical_query_tester() -> None:
                     org_levels=org_levels,
                 )
 
-                with st.spinner("Running analytical query + audit snapshot..."):
-                    result = run_analytical_query(params)
-                    snapshot = build_audit_snapshot(result)
+                status.update(label="Step 1/1 — Running CKAN analytical query…", state="running")
+                t1 = time.perf_counter()
+                result = run_analytical_query(params)
+                t2 = time.perf_counter()
+                status.write(f"CKAN query completed in {t2 - t1:0.2f}s (total elapsed {t2 - t0:0.2f}s)")
+                status.update(label="Done.", state="complete")
 
-                st.success("Analytical query succeeded.")
-                st.write(f"Question: {snapshot.question_code} — {snapshot.question_label_en}")
-                st.write(f"Organization: {snapshot.org_label_en or '(label not found)'}")
-                st.write(f"Demographic: {snapshot.dem_label_en or 'Overall (no breakdown)'}")
-                st.write(f"Metric: {snapshot.metric_name_en}")
+                st.success("Analytical query succeeded (basic mode; no audit).")
+                st.write(f"Question: {result.params.question_code} — {result.question_label_en}")
+                st.write(f"Organization: {result.org_label_en or '(label not found)'}")
+                st.write(f"Demographic: {result.dem_label_en or 'Overall (no breakdown)'}")
 
                 rows = []
                 for m in result.yearly_metrics:
@@ -334,8 +339,12 @@ def _render_analytical_query_tester() -> None:
                 st.dataframe(result.raw_df, use_container_width=True)
 
             except QueryEngineError as qerr:
+                status.update(label="Analytical query failed.", state="error")
                 st.error(f"Analytical query failed: {qerr}")
+                st.text_area("Traceback", value=traceback.format_exc(), height=280)
+
             except Exception:
+                status.update(label="Unexpected error.", state="error")
                 st.error("Unexpected error while running analytical query.")
                 st.text_area("Traceback", value=traceback.format_exc(), height=280)
 
