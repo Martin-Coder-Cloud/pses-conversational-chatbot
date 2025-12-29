@@ -34,19 +34,21 @@ class QueryParameters:
     """
     Structured parameters required to query the PSES DataStore.
 
-    Rules (aligned with your design):
-      - survey_years: always explicit list (UI defaults to all available cycles)
+    Rules:
+      - survey_years: explicit list (UI defaults to all cycles)
       - question_code: required (e.g., 'Q08')
       - demcode:
-          * None => overall / no breakdown baseline.
-            IMPORTANT: overall is queried as DEMCODE == "" (empty string)
-            because open.canada.ca does not support datastore_search_sql.
-          * str  => specific demographic code (equality filter)
+          * None => overall / no breakdown.
+            IMPORTANT: CKAN datastore_search cannot reliably filter for blank cells.
+            Therefore overall is implemented as:
+              - query WITHOUT DEMCODE filter
+              - then filter locally where DEMCODE is blank/NULL/whitespace
+          * str  => specific demographic code (filter equality at CKAN level)
       - org_levels: required explicit LEVEL1ID..LEVEL5ID integers
     """
     survey_years: List[int]
     question_code: str
-    demcode: Optional[str]                 # None => overall baseline
+    demcode: Optional[str]  # None => overall baseline
     org_levels: Dict[str, int]
 
 
@@ -73,7 +75,7 @@ class QueryResult:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for labels from metadata
+# Metadata label helpers
 # ---------------------------------------------------------------------------
 
 def _lookup_question_labels(question_code: str) -> Tuple[str, str]:
@@ -90,9 +92,7 @@ def _lookup_question_labels(question_code: str) -> Tuple[str, str]:
 
 def _lookup_org_labels(org_levels: Dict[str, int]) -> Tuple[str | None, str | None]:
     if not org_levels:
-        raise QueryEngineError(
-            "org_levels is empty. LEVEL1ID..LEVEL5ID must be specified for every analytical query."
-        )
+        raise QueryEngineError("org_levels is empty. LEVEL1ID..LEVEL5ID must be specified.")
 
     org_meta = load_org_meta()
 
@@ -114,12 +114,10 @@ def _lookup_org_labels(org_levels: Dict[str, int]) -> Tuple[str | None, str | No
 
 
 def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None]:
-    # Per your rule: overall/no breakdown is represented as None in the pipeline
     if demcode is None or str(demcode).strip() == "":
         return "Overall (no breakdown)", "Ensemble (sans ventilation)"
 
     code = str(demcode).strip()
-
     dem_meta = load_demographics_meta()
 
     col_name = "demcode" if "demcode" in dem_meta.columns else ("code" if "code" in dem_meta.columns else None)
@@ -142,21 +140,20 @@ def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# Year validation (local only — NO CKAN calls)
+# Years (local only)
 # ---------------------------------------------------------------------------
 
 def _known_survey_years() -> List[int]:
     """
-    Local known cycles (no network calls).
-    Optionally define PSES_KNOWN_SURVEY_YEARS in config.py later.
+    Local known cycles (no network calls). If you later add
+    PSES_KNOWN_SURVEY_YEARS in config.py, it will be used automatically.
     """
     try:
         from pses_chatbot.config import PSES_KNOWN_SURVEY_YEARS  # type: ignore
-
         years = [int(y) for y in list(PSES_KNOWN_SURVEY_YEARS)]
         return sorted(set(years))
     except Exception:
-        # Fallback for current open.canada.ca PSES table
+        # Current known cycles in your open.canada.ca table
         return [2019, 2020, 2022, 2024]
 
 
@@ -167,7 +164,6 @@ def _validate_years(requested: List[int]) -> List[int]:
             cleaned.append(int(y))
         except Exception:
             continue
-
     cleaned = sorted(set(cleaned))
     if not cleaned:
         raise QueryEngineError("SURVEYR list must contain at least one valid year.")
@@ -175,10 +171,6 @@ def _validate_years(requested: List[int]) -> List[int]:
     known = _known_survey_years()
     if known:
         known_set = set(known)
-        invalid = [y for y in cleaned if y not in known_set]
-        if invalid:
-            logger.warning("Requested years not in locally-known cycles: %s. Known: %s", invalid, known)
-
         intersection = [y for y in cleaned if y in known_set]
         if intersection:
             return intersection
@@ -187,24 +179,18 @@ def _validate_years(requested: List[int]) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
-# Core query functions (NO SQL; datastore_search only)
+# CKAN query helpers
 # ---------------------------------------------------------------------------
 
-def _build_filters(params: QueryParameters, year: int) -> Dict[str, Any]:
+def _build_filters_base(params: QueryParameters, year: int) -> Dict[str, Any]:
     if not params.question_code:
         raise QueryEngineError("QUESTION (question_code) must be specified.")
     if not params.org_levels:
         raise QueryEngineError("org_levels must always be specified (LEVEL1ID..LEVEL5ID).")
 
-    # DEMCODE: None => overall baseline => DEMCODE == "" (empty string)
-    demcode_value = ""
-    if params.demcode is not None and str(params.demcode).strip() != "":
-        demcode_value = str(params.demcode).strip()
-
     filters: Dict[str, Any] = {
         QUESTION_COL: str(params.question_code).strip(),
         SURVEY_YEAR_COL: int(year),
-        DEMCODE_COL: demcode_value,
     }
 
     for col in LEVEL_COLS:
@@ -214,7 +200,70 @@ def _build_filters(params: QueryParameters, year: int) -> Dict[str, Any]:
     return filters
 
 
-def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 5_000) -> pd.DataFrame:
+def _is_overall_demcode_value(x: Any) -> bool:
+    """
+    Overall/no breakdown row is represented by DEMCODE blank.
+    Treat None, NaN, "", and whitespace-only as overall.
+    """
+    if x is None:
+        return True
+    try:
+        if pd.isna(x):
+            return True
+    except Exception:
+        pass
+    return str(x).strip() == ""
+
+
+def _fetch_one_year(params: QueryParameters, year: int, max_rows_per_year: int) -> pd.DataFrame:
+    """
+    Fetch one year slice.
+
+    - If demcode is specified: filter DEMCODE at CKAN equality level.
+    - If demcode is None (overall): do NOT filter DEMCODE in CKAN;
+      fetch the slice and filter locally to DEMCODE blank/NULL.
+    """
+    base_filters = _build_filters_base(params, year)
+
+    # Case A: specific demographic requested
+    if params.demcode is not None and str(params.demcode).strip() != "":
+        base_filters[DEMCODE_COL] = str(params.demcode).strip()
+
+        return query_pses_results(
+            filters=base_filters,
+            fields=None,
+            sort=None,
+            max_rows=max_rows_per_year,
+            page_size=min(max_rows_per_year, 10_000),
+            timeout_seconds=120,
+            include_total=False,
+        )
+
+    # Case B: overall requested (demcode None)
+    # Fetch without DEMCODE filter, then filter locally to DEMCODE blank.
+    df_all = query_pses_results(
+        filters=base_filters,
+        fields=None,
+        sort=None,
+        max_rows=max_rows_per_year,
+        page_size=min(max_rows_per_year, 10_000),
+        timeout_seconds=120,
+        include_total=False,
+    )
+
+    if df_all.empty:
+        return df_all
+
+    if DEMCODE_COL not in df_all.columns:
+        raise QueryEngineError(
+            f"Returned slice does not contain '{DEMCODE_COL}' column; cannot isolate overall row."
+        )
+
+    df_overall = df_all[df_all[DEMCODE_COL].apply(_is_overall_demcode_value)].copy()
+    return df_overall
+
+
+def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 50_000) -> pd.DataFrame:
     if not params.survey_years:
         raise QueryEngineError("SURVEYR list must be specified (at least one year).")
 
@@ -222,21 +271,15 @@ def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 5_000) ->
 
     frames: List[pd.DataFrame] = []
     for y in years:
-        filters = _build_filters(params, year=y)
-        logger.info("Querying PSES DataStore with filters=%s", filters)
-
-        df_y = query_pses_results(
-            filters=filters,
-            fields=None,   # keep full row
-            sort=None,
-            max_rows=max_rows_per_year,
-            page_size=min(max_rows_per_year, 10_000),
-            timeout_seconds=120,  # give portal time
-            include_total=False,
+        logger.info(
+            "Querying PSES DataStore for year=%s (question=%s, demcode=%s, org=%s)",
+            y, params.question_code, params.demcode, params.org_levels
         )
 
+        df_y = _fetch_one_year(params, year=y, max_rows_per_year=max_rows_per_year)
+
         if df_y.empty:
-            logger.warning("No records returned for year %s and filters %s", y, filters)
+            logger.warning("No records returned for year %s (after DEMCODE handling).", y)
 
         frames.append(df_y)
 
@@ -255,7 +298,7 @@ def _extract_yearly_metrics(df: pd.DataFrame) -> List[YearlyMetric]:
             f"Required columns missing from slice: {missing}. Present columns: {list(df.columns)}"
         )
 
-    # Expect exactly 1 row per year for this exact parameter combination
+    # Expect exactly 1 row per year (after DEMCODE handling)
     counts = df.groupby(SURVEY_YEAR_COL).size()
     problematic = counts[counts > 1]
     if not problematic.empty:
@@ -269,8 +312,7 @@ def _extract_yearly_metrics(df: pd.DataFrame) -> List[YearlyMetric]:
     if ANSCOUNT_COL in df.columns:
         work_cols.append(ANSCOUNT_COL)
 
-    work = df[work_cols].copy()
-    work = work.sort_values(SURVEY_YEAR_COL)
+    work = df[work_cols].copy().sort_values(SURVEY_YEAR_COL)
 
     metrics: List[YearlyMetric] = []
     prev_value: float | None = None
