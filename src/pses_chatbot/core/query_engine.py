@@ -19,9 +19,17 @@ logger = logging.getLogger(__name__)
 SURVEY_YEAR_COL = "SURVEYR"
 QUESTION_COL = "QUESTION"
 DEMCODE_COL = "DEMCODE"
-MOST_POSITIVE_COL = "MOST POSITIVE OR LEAST NEGATIVE"
-ANSCOUNT_COL = "ANSCOUNT"
 
+# The API table uses standardized metric columns:
+# POSITIVE / NEUTRAL / NEGATIVE / AGREE / SCORE5 / SCORE100 / ANSCOUNT
+# Your business rule "MOST POSITIVE OR LEAST NEGATIVE" corresponds to POSITIVE.
+PRIMARY_METRIC_COL = "POSITIVE"
+ALT_METRIC_COLS = [
+    "MOST POSITIVE OR LEAST NEGATIVE",  # (older/local naming)
+    "MOST_POSITIVE_OR_LEAST_NEGATIVE",  # just in case
+]
+
+ANSCOUNT_COL = "ANSCOUNT"
 LEVEL_COLS = ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]
 
 
@@ -72,6 +80,7 @@ class QueryResult:
     org_label_fr: str | None
     dem_label_en: str | None
     dem_label_fr: str | None
+    metric_col_used: str  # NEW: which metric column we used (POSITIVE, etc.)
 
 
 # ---------------------------------------------------------------------------
@@ -145,16 +154,9 @@ def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None]:
 
 def _known_survey_years() -> List[int]:
     """
-    Local known cycles (no network calls). If you later add
-    PSES_KNOWN_SURVEY_YEARS in config.py, it will be used automatically.
+    Local known cycles (no network calls).
     """
-    try:
-        from pses_chatbot.config import PSES_KNOWN_SURVEY_YEARS  # type: ignore
-        years = [int(y) for y in list(PSES_KNOWN_SURVEY_YEARS)]
-        return sorted(set(years))
-    except Exception:
-        # Current known cycles in your open.canada.ca table
-        return [2019, 2020, 2022, 2024]
+    return [2019, 2020, 2022, 2024]
 
 
 def _validate_years(requested: List[int]) -> List[int]:
@@ -168,14 +170,31 @@ def _validate_years(requested: List[int]) -> List[int]:
     if not cleaned:
         raise QueryEngineError("SURVEYR list must contain at least one valid year.")
 
-    known = _known_survey_years()
-    if known:
-        known_set = set(known)
-        intersection = [y for y in cleaned if y in known_set]
-        if intersection:
-            return intersection
+    known_set = set(_known_survey_years())
+    intersection = [y for y in cleaned if y in known_set]
+    return intersection if intersection else cleaned
 
-    return cleaned
+
+# ---------------------------------------------------------------------------
+# Metric column resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_metric_column(df: pd.DataFrame) -> str:
+    """
+    Resolve which column represents the business metric:
+    "Most positive or least negative".
+
+    On open.canada.ca DataStore, this is POSITIVE.
+    """
+    if PRIMARY_METRIC_COL in df.columns:
+        return PRIMARY_METRIC_COL
+    for c in ALT_METRIC_COLS:
+        if c in df.columns:
+            return c
+    raise QueryEngineError(
+        f"Required metric column not found. Expected '{PRIMARY_METRIC_COL}' "
+        f"(or one of {ALT_METRIC_COLS}). Present columns: {list(df.columns)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +235,6 @@ def _is_overall_demcode_value(x: Any) -> bool:
 
 
 def _fetch_one_year(params: QueryParameters, year: int, max_rows_per_year: int) -> pd.DataFrame:
-    """
-    Fetch one year slice.
-
-    - If demcode is specified: filter DEMCODE at CKAN equality level.
-    - If demcode is None (overall): do NOT filter DEMCODE in CKAN;
-      fetch the slice and filter locally to DEMCODE blank/NULL.
-    """
     base_filters = _build_filters_base(params, year)
 
     # Case A: specific demographic requested
@@ -240,7 +252,6 @@ def _fetch_one_year(params: QueryParameters, year: int, max_rows_per_year: int) 
         )
 
     # Case B: overall requested (demcode None)
-    # Fetch without DEMCODE filter, then filter locally to DEMCODE blank.
     df_all = query_pses_results(
         filters=base_filters,
         fields=None,
@@ -259,8 +270,7 @@ def _fetch_one_year(params: QueryParameters, year: int, max_rows_per_year: int) 
             f"Returned slice does not contain '{DEMCODE_COL}' column; cannot isolate overall row."
         )
 
-    df_overall = df_all[df_all[DEMCODE_COL].apply(_is_overall_demcode_value)].copy()
-    return df_overall
+    return df_all[df_all[DEMCODE_COL].apply(_is_overall_demcode_value)].copy()
 
 
 def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 50_000) -> pd.DataFrame:
@@ -275,12 +285,7 @@ def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 50_000) -
             "Querying PSES DataStore for year=%s (question=%s, demcode=%s, org=%s)",
             y, params.question_code, params.demcode, params.org_levels
         )
-
         df_y = _fetch_one_year(params, year=y, max_rows_per_year=max_rows_per_year)
-
-        if df_y.empty:
-            logger.warning("No records returned for year %s (after DEMCODE handling).", y)
-
         frames.append(df_y)
 
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -290,13 +295,17 @@ def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 50_000) -
     return df
 
 
-def _extract_yearly_metrics(df: pd.DataFrame) -> List[YearlyMetric]:
-    required_cols = {SURVEY_YEAR_COL, MOST_POSITIVE_COL}
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
+def _extract_yearly_metrics(df: pd.DataFrame) -> Tuple[List[YearlyMetric], str]:
+    """
+    Extract the POSITIVE metric by year (no aggregation).
+    Returns (metrics, metric_col_used).
+    """
+    if SURVEY_YEAR_COL not in df.columns:
         raise QueryEngineError(
-            f"Required columns missing from slice: {missing}. Present columns: {list(df.columns)}"
+            f"Required column missing from slice: {SURVEY_YEAR_COL}. Present: {list(df.columns)}"
         )
+
+    metric_col = _resolve_metric_column(df)
 
     # Expect exactly 1 row per year (after DEMCODE handling)
     counts = df.groupby(SURVEY_YEAR_COL).size()
@@ -308,7 +317,7 @@ def _extract_yearly_metrics(df: pd.DataFrame) -> List[YearlyMetric]:
             f"Problematic years: {problematic.to_dict()}"
         )
 
-    work_cols = [SURVEY_YEAR_COL, MOST_POSITIVE_COL]
+    work_cols = [SURVEY_YEAR_COL, metric_col]
     if ANSCOUNT_COL in df.columns:
         work_cols.append(ANSCOUNT_COL)
 
@@ -321,7 +330,7 @@ def _extract_yearly_metrics(df: pd.DataFrame) -> List[YearlyMetric]:
         year = int(row[SURVEY_YEAR_COL])
 
         try:
-            value = float(row[MOST_POSITIVE_COL])
+            value = float(row[metric_col])
         except Exception:
             value = float("nan")
 
@@ -341,7 +350,7 @@ def _extract_yearly_metrics(df: pd.DataFrame) -> List[YearlyMetric]:
         if pd.notna(value):
             prev_value = value
 
-    return metrics
+    return metrics, metric_col
 
 
 def _compute_overall_delta(metrics: List[YearlyMetric]) -> float | None:
@@ -357,7 +366,7 @@ def run_analytical_query(params: QueryParameters) -> QueryResult:
     logger.info("Running analytical query with params=%s", params)
 
     raw_df = _fetch_raw_slice(params)
-    yearly_metrics = _extract_yearly_metrics(raw_df)
+    yearly_metrics, metric_col_used = _extract_yearly_metrics(raw_df)
     overall_delta = _compute_overall_delta(yearly_metrics)
 
     q_en, q_fr = _lookup_question_labels(params.question_code)
@@ -375,4 +384,5 @@ def run_analytical_query(params: QueryParameters) -> QueryResult:
         org_label_fr=org_fr,
         dem_label_en=dem_en,
         dem_label_fr=dem_fr,
+        metric_col_used=metric_col_used,
     )
