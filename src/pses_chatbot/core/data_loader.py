@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -34,7 +35,6 @@ class _DataStorePage:
 def _make_session() -> requests.Session:
     """
     Requests session with retries/backoff for transient CKAN issues (429/5xx).
-    This reduces “silent hangs” caused by intermittent portal instability.
     """
     session = requests.Session()
 
@@ -79,17 +79,45 @@ def _ckan_post_json(
     *,
     timeout_seconds: int,
 ) -> Dict[str, Any]:
+    """
+    POST JSON to a CKAN action endpoint and return the decoded dict.
+
+    Robustness:
+      - Some CKAN instances occasionally return double-encoded JSON, where resp.json()
+        yields a *string* that itself contains JSON. We detect and json.loads() it.
+    """
     try:
         resp = _SESSION.post(url, json=payload, timeout=timeout_seconds)
     except requests.exceptions.RequestException as exc:
         raise DataLoaderError(f"HTTP error while calling CKAN: {exc}") from exc
 
+    # Decode JSON (first pass)
     try:
-        data = resp.json()
+        data: Any = resp.json()
     except Exception as exc:
+        preview = (resp.text or "")[:800]
         raise DataLoaderError(
-            f"Non-JSON response from CKAN (status={resp.status_code})."
+            f"Non-JSON response from CKAN (status={resp.status_code}). "
+            f"Response preview: {preview}"
         ) from exc
+
+    # Handle double-encoded JSON: resp.json() returned a string containing JSON
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            preview = (data or "")[:800]
+            raise DataLoaderError(
+                "CKAN returned JSON as a string (double-encoded) but it could not be parsed. "
+                f"Response string preview: {preview}"
+            )
+
+    if not isinstance(data, dict):
+        preview = str(data)[:800]
+        raise DataLoaderError(
+            "Unexpected CKAN response type after JSON decoding. "
+            f"Expected dict, got {type(data).__name__}. Preview: {preview}"
+        )
 
     if not data.get("success", False):
         err = data.get("error", {}) or {}
@@ -112,7 +140,7 @@ def _datastore_search(
     timeout_seconds: int,
 ) -> _DataStorePage:
     """
-    CKAN datastore_search via POST JSON (more reliable than long GET querystrings).
+    CKAN datastore_search via POST JSON.
     """
     payload: Dict[str, Any] = {
         "resource_id": resource_id,
@@ -154,8 +182,8 @@ def query_pses_results(
 
     Notes:
       - No aggregation is performed.
-      - For “overall/no breakdown” DEMCODE, use query_pses_results_overall_sql()
-        because CKAN filters cannot express (DEMCODE IS NULL OR DEMCODE='').
+      - For “overall/no breakdown” DEMCODE (None / NULL / ''), use query_pses_results_overall_sql()
+        because equality filters cannot express (DEMCODE IS NULL OR DEMCODE='').
     """
     rid = _resolve_resource_id(resource_id)
 
@@ -218,8 +246,6 @@ def query_pses_results_overall_sql(
 ) -> pd.DataFrame:
     """
     Query “overall/no breakdown” rows where DEMCODE is NULL or '' using datastore_search_sql.
-
-    This is the canonical way to fetch baseline rows from this DataStore.
     """
     rid = _resolve_resource_id(resource_id)
 
@@ -261,8 +287,6 @@ def get_available_survey_years(
 ) -> List[int]:
     """
     Discover available SURVEYR values using datastore_search_sql.
-
-    IMPORTANT: do not call this automatically on app boot; call it from a button.
     """
     rid = _resolve_resource_id(resource_id)
 
