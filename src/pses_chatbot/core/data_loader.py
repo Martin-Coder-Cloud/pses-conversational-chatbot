@@ -10,16 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from pses_chatbot.config import (
-    CKAN_DATASTORE_SEARCH_URL,
-    PSES_DATASTORE_RESOURCE_ID,
-)
-
-# Derived endpoint (keeps config minimal)
-# Example: https://open.canada.ca/data/en/api/3/action/datastore_search_sql
-CKAN_DATASTORE_SEARCH_SQL_URL = CKAN_DATASTORE_SEARCH_URL.replace(
-    "datastore_search", "datastore_search_sql"
-)
+from pses_chatbot.config import CKAN_DATASTORE_SEARCH_URL, PSES_DATASTORE_RESOURCE_ID
 
 
 class DataLoaderError(Exception):
@@ -45,7 +36,7 @@ def _make_session() -> requests.Session:
         status=3,
         backoff_factor=0.8,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET", "POST"}),
+        allowed_methods=frozenset({"GET"}),  # open.canada.ca: GET is the safe default
         raise_on_status=False,
     )
 
@@ -68,30 +59,27 @@ def _resolve_resource_id(resource_id: Optional[str] = None) -> str:
     return rid
 
 
-def _safe_sql_literal(value: str) -> str:
-    """Escape single quotes for SQL literals."""
-    return value.replace("'", "''")
-
-
-def _ckan_post_json(
-    url: str,
-    payload: Dict[str, Any],
-    *,
-    timeout_seconds: int,
-) -> Dict[str, Any]:
+def _encode_filters(filters: Optional[Dict[str, Any]]) -> Optional[str]:
     """
-    POST JSON to a CKAN action endpoint and return the decoded dict.
+    For datastore_search via GET, CKAN expects `filters` as a JSON string.
 
-    Robustness:
-      - Some CKAN instances occasionally return double-encoded JSON, where resp.json()
-        yields a *string* that itself contains JSON. We detect and json.loads() it.
+    IMPORTANT: we must preserve empty strings exactly (e.g., DEMCODE="").
     """
+    if filters is None:
+        return None
     try:
-        resp = _SESSION.post(url, json=payload, timeout=timeout_seconds)
+        return json.dumps(filters, ensure_ascii=False)
+    except Exception as exc:
+        raise DataLoaderError(f"Could not JSON-encode filters for CKAN: {exc}") from exc
+
+
+def _ckan_get_json(url: str, params: Dict[str, Any], *, timeout_seconds: int) -> Dict[str, Any]:
+    try:
+        resp = _SESSION.get(url, params=params, timeout=timeout_seconds)
     except requests.exceptions.RequestException as exc:
         raise DataLoaderError(f"HTTP error while calling CKAN: {exc}") from exc
 
-    # Decode JSON (first pass)
+    # Try JSON first
     try:
         data: Any = resp.json()
     except Exception as exc:
@@ -101,14 +89,14 @@ def _ckan_post_json(
             f"Response preview: {preview}"
         ) from exc
 
-    # Handle double-encoded JSON: resp.json() returned a string containing JSON
+    # Some CKAN responses can be stringified JSON; decode once.
     if isinstance(data, str):
         try:
             data = json.loads(data)
         except Exception:
             preview = (data or "")[:800]
             raise DataLoaderError(
-                "CKAN returned JSON as a string (double-encoded) but it could not be parsed. "
+                "CKAN returned JSON as a string but it could not be parsed. "
                 f"Response string preview: {preview}"
             )
 
@@ -140,22 +128,29 @@ def _datastore_search(
     timeout_seconds: int,
 ) -> _DataStorePage:
     """
-    CKAN datastore_search via POST JSON.
+    CKAN datastore_search via GET.
     """
-    payload: Dict[str, Any] = {
+    params: Dict[str, Any] = {
         "resource_id": resource_id,
         "limit": int(limit),
         "offset": int(offset),
-        "include_total": bool(include_total),
     }
-    if filters is not None:
-        payload["filters"] = filters
-    if fields:
-        payload["fields"] = fields
-    if sort:
-        payload["sort"] = sort
 
-    data = _ckan_post_json(CKAN_DATASTORE_SEARCH_URL, payload, timeout_seconds=timeout_seconds)
+    if include_total:
+        params["include_total"] = "true"
+
+    filt_str = _encode_filters(filters)
+    if filt_str is not None:
+        params["filters"] = filt_str
+
+    if fields:
+        # CKAN accepts comma-separated fields in many installs
+        params["fields"] = ",".join(fields)
+
+    if sort:
+        params["sort"] = sort
+
+    data = _ckan_get_json(CKAN_DATASTORE_SEARCH_URL, params, timeout_seconds=timeout_seconds)
     result = data.get("result", {}) or {}
     records = result.get("records", []) or []
     total = result.get("total", None)
@@ -180,10 +175,10 @@ def query_pses_results(
     """
     Query PSES DataStore using equality filters (datastore_search) and paging.
 
-    Notes:
-      - No aggregation is performed.
-      - For “overall/no breakdown” DEMCODE (None / NULL / ''), use query_pses_results_overall_sql()
-        because equality filters cannot express (DEMCODE IS NULL OR DEMCODE='').
+    IMPORTANT:
+      - Overall/no breakdown must be expressed as DEMCODE == "" (empty string),
+        because open.canada.ca does not expose datastore_search_sql and we cannot
+        use (IS NULL OR '') logic.
     """
     rid = _resolve_resource_id(resource_id)
 
@@ -234,75 +229,53 @@ def query_pses_results(
     return pd.DataFrame.from_records(records)
 
 
-def query_pses_results_overall_sql(
-    *,
-    question_code: str,
-    survey_year: int,
-    org_levels: Dict[str, int],
-    fields: Optional[List[str]] = None,
-    timeout_seconds: int = 90,
-    limit: int = 50_000,
-    resource_id: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Query “overall/no breakdown” rows where DEMCODE is NULL or '' using datastore_search_sql.
-    """
-    rid = _resolve_resource_id(resource_id)
-
-    q = _safe_sql_literal(str(question_code).strip())
-    y = int(survey_year)
-
-    where_parts: List[str] = [
-        f"\"QUESTION\" = '{q}'",
-        f"\"SURVEYR\" = {y}",
-        "(\"DEMCODE\" IS NULL OR \"DEMCODE\" = '')",
-    ]
-
-    for col in ("LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"):
-        if col in org_levels:
-            where_parts.append(f"\"{col}\" = {int(org_levels[col])}")
-
-    select_clause = "*"
-    if fields and len(fields) > 0:
-        safe_fields = [f"\"{f.replace('\"', '')}\"" for f in fields]
-        select_clause = ", ".join(safe_fields)
-
-    sql = f'SELECT {select_clause} FROM "{rid}" WHERE ' + " AND ".join(where_parts) + f" LIMIT {int(limit)}"
-    payload = {"sql": sql}
-
-    data = _ckan_post_json(CKAN_DATASTORE_SEARCH_SQL_URL, payload, timeout_seconds=timeout_seconds)
-    result = data.get("result", {}) or {}
-    records = result.get("records", []) or []
-
-    if not records:
-        return pd.DataFrame()
-
-    return pd.DataFrame.from_records(records)
-
-
 def get_available_survey_years(
     *,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 60,
     resource_id: Optional[str] = None,
+    max_scan_rows: int = 50_000,
+    page_size: int = 5_000,
 ) -> List[int]:
     """
-    Discover available SURVEYR values using datastore_search_sql.
+    Discover available SURVEYR values WITHOUT SQL.
+
+    We sample a limited number of rows requesting only SURVEYR and return distinct years.
+    This avoids scanning the full 15M+ table.
     """
     rid = _resolve_resource_id(resource_id)
 
-    sql = f'SELECT DISTINCT "SURVEYR" FROM "{rid}" ORDER BY "SURVEYR"'
-    payload = {"sql": sql}
+    years: set[int] = set()
+    offset = 0
+    page_size = max(100, min(int(page_size), 10_000))
+    max_scan_rows = max(1_000, int(max_scan_rows))
 
-    data = _ckan_post_json(CKAN_DATASTORE_SEARCH_SQL_URL, payload, timeout_seconds=timeout_seconds)
-    result = data.get("result", {}) or {}
-    records = result.get("records", []) or []
+    while offset < max_scan_rows:
+        page = _datastore_search(
+            resource_id=rid,
+            filters=None,
+            fields=["SURVEYR"],
+            sort=None,
+            limit=page_size,
+            offset=offset,
+            include_total=False,
+            timeout_seconds=timeout_seconds,
+        )
 
-    years: List[int] = []
-    for r in records:
-        v = r.get("SURVEYR")
-        try:
-            years.append(int(v))
-        except Exception:
-            continue
+        if not page.records:
+            break
 
-    return sorted(set(years))
+        for r in page.records:
+            v = r.get("SURVEYR")
+            try:
+                years.add(int(v))
+            except Exception:
+                continue
+
+        # If years stabilize quickly, stop early (heuristic)
+        if len(years) >= 4:
+            # For current dataset this is typically enough; keep it conservative.
+            pass
+
+        offset += page_size
+
+    return sorted(years)
