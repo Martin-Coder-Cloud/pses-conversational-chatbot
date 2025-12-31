@@ -3,162 +3,127 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from pses_chatbot.config import CKAN_DATASTORE_SEARCH_URL, PSES_DATASTORE_RESOURCE_ID
+from pses_chatbot.config import (
+    CKAN_DATASTORE_SEARCH_URL,
+    PSES_DATASTORE_RESOURCE_ID,
+)
 
 
 class DataLoaderError(Exception):
-    """Raised when CKAN/DataStore calls fail or return invalid responses."""
+    """Raised when CKAN DataStore calls fail or return unexpected shapes."""
 
 
-@dataclass(frozen=True)
-class _DataStorePage:
+@dataclass
+class CKANSearchResult:
     records: List[Dict[str, Any]]
-    total: Optional[int]
+    total: Optional[int] = None
 
 
-def _make_session() -> requests.Session:
+def _build_retry_session() -> requests.Session:
     """
-    Requests session with retries/backoff for transient CKAN issues (429/5xx).
+    Build a requests Session with conservative retries.
+    Streamlit Cloud + open.canada.ca can be slow or transiently flaky.
     """
     session = requests.Session()
 
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
-        backoff_factor=0.8,
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=0.6,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),  # open.canada.ca: GET is the safe default
+        allowed_methods=frozenset({"GET"}),
         raise_on_status=False,
     )
 
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
     return session
 
 
-_SESSION = _make_session()
+_SESSION: Optional[requests.Session] = None
 
 
-def _resolve_resource_id(resource_id: Optional[str] = None) -> str:
-    rid = (resource_id or "").strip() or (PSES_DATASTORE_RESOURCE_ID or "").strip()
-    if not rid:
-        raise DataLoaderError(
-            "Missing CKAN resource id. Set PSES_DATASTORE_RESOURCE_ID in config.py "
-            "or via environment variable."
-        )
-    return rid
+def _get_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = _build_retry_session()
+    return _SESSION
 
 
-def _encode_filters(filters: Optional[Dict[str, Any]]) -> Optional[str]:
-    """
-    For datastore_search via GET, CKAN expects `filters` as a JSON string.
-
-    IMPORTANT: we must preserve empty strings exactly (e.g., DEMCODE="").
-    """
-    if filters is None:
-        return None
-    try:
-        return json.dumps(filters, ensure_ascii=False)
-    except Exception as exc:
-        raise DataLoaderError(f"Could not JSON-encode filters for CKAN: {exc}") from exc
-
-
-def _ckan_get_json(url: str, params: Dict[str, Any], *, timeout_seconds: int) -> Dict[str, Any]:
-    try:
-        resp = _SESSION.get(url, params=params, timeout=timeout_seconds)
-    except requests.exceptions.RequestException as exc:
-        raise DataLoaderError(f"HTTP error while calling CKAN: {exc}") from exc
-
-    # Try JSON first
-    try:
-        data: Any = resp.json()
-    except Exception as exc:
-        preview = (resp.text or "")[:800]
-        raise DataLoaderError(
-            f"Non-JSON response from CKAN (status={resp.status_code}). "
-            f"Response preview: {preview}"
-        ) from exc
-
-    # Some CKAN responses can be stringified JSON; decode once.
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except Exception:
-            preview = (data or "")[:800]
-            raise DataLoaderError(
-                "CKAN returned JSON as a string but it could not be parsed. "
-                f"Response string preview: {preview}"
-            )
-
-    if not isinstance(data, dict):
-        preview = str(data)[:800]
-        raise DataLoaderError(
-            "Unexpected CKAN response type after JSON decoding. "
-            f"Expected dict, got {type(data).__name__}. Preview: {preview}"
-        )
-
-    if not data.get("success", False):
-        err = data.get("error", {}) or {}
-        raise DataLoaderError(
-            f"CKAN call failed (status={resp.status_code}, success=false): {err}"
-        )
-
-    return data
-
-
-def _datastore_search(
+def _ckan_datastore_search(
     *,
     resource_id: str,
     filters: Optional[Dict[str, Any]],
     fields: Optional[List[str]],
     sort: Optional[str],
-    limit: int,
     offset: int,
-    include_total: bool,
+    limit: int,
     timeout_seconds: int,
-) -> _DataStorePage:
+    include_total: bool,
+) -> CKANSearchResult:
     """
-    CKAN datastore_search via GET.
+    Calls CKAN datastore_search (GET).
+    open.canada.ca supports datastore_search (not datastore_search_sql).
     """
     params: Dict[str, Any] = {
         "resource_id": resource_id,
-        "limit": int(limit),
         "offset": int(offset),
+        "limit": int(limit),
     }
 
-    if include_total:
-        params["include_total"] = "true"
+    # CKAN expects filters as a JSON string
+    if filters:
+        params["filters"] = json.dumps(filters, ensure_ascii=False)
 
-    filt_str = _encode_filters(filters)
-    if filt_str is not None:
-        params["filters"] = filt_str
-
+    # 'fields' can reduce payload size if you only need a few columns
     if fields:
-        # CKAN accepts comma-separated fields in many installs
         params["fields"] = ",".join(fields)
 
     if sort:
         params["sort"] = sort
 
-    data = _ckan_get_json(CKAN_DATASTORE_SEARCH_URL, params, timeout_seconds=timeout_seconds)
-    result = data.get("result", {}) or {}
-    records = result.get("records", []) or []
-    total = result.get("total", None)
+    if include_total:
+        params["include_total"] = "true"
+
+    try:
+        resp = _get_session().get(CKAN_DATASTORE_SEARCH_URL, params=params, timeout=timeout_seconds)
+    except Exception as exc:
+        raise DataLoaderError(f"HTTP error while calling datastore_search: {exc}") from exc
+
+    # CKAN sometimes returns 200 with success=false inside JSON
+    try:
+        data = resp.json()
+    except Exception as exc:
+        preview = (resp.text or "")[:200]
+        raise DataLoaderError(f"Non-JSON response from CKAN (status={resp.status_code}). Preview: {preview}") from exc
+
+    if not isinstance(data, dict):
+        raise DataLoaderError(f"Unexpected CKAN response type: {type(data)}")
+
+    if not data.get("success", False):
+        # include any CKAN message if present
+        msg = data.get("error") or data.get("help") or data
+        raise DataLoaderError(f"CKAN datastore_search returned success=false. Status={resp.status_code}. Detail={msg}")
+
+    result = data.get("result") or {}
+    records = result.get("records") or []
+    total = result.get("total") if include_total else None
 
     if not isinstance(records, list):
-        raise DataLoaderError("Unexpected CKAN response: result.records is not a list.")
+        raise DataLoaderError("CKAN result.records is not a list")
 
-    return _DataStorePage(records=records, total=total if include_total else None)
+    return CKANSearchResult(records=records, total=total)
 
 
 def query_pses_results(
@@ -171,111 +136,128 @@ def query_pses_results(
     timeout_seconds: int = 90,
     include_total: bool = False,
     resource_id: Optional[str] = None,
+    stop_after_rows: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Query PSES DataStore using equality filters (datastore_search) and paging.
+    Query PSES DataStore using equality filters (datastore_search) with paging.
 
-    IMPORTANT:
-      - Overall/no breakdown must be expressed as DEMCODE == "" (empty string),
-        because open.canada.ca does not expose datastore_search_sql and we cannot
-        use (IS NULL OR '') logic.
+    Key behavior:
+      - No aggregation is performed.
+      - 'filters' is equality-match only (CKAN DataStore).
+      - stop_after_rows can be used to exit early once enough rows are found.
+
+    Parameters:
+      - max_rows: absolute safety cap on rows returned
+      - page_size: per-page limit (keep modest; big pages can time out)
+      - stop_after_rows: if set (e.g., 1), stop paging once >= that many rows collected
     """
-    rid = _resolve_resource_id(resource_id)
-
-    if max_rows <= 0:
-        return pd.DataFrame()
-
-    # Prevent accidental huge pulls if filters are missing
-    if filters is None and max_rows > 500:
+    rid = (resource_id or PSES_DATASTORE_RESOURCE_ID or "").strip()
+    if not rid:
         raise DataLoaderError(
-            "Refusing an unfiltered datastore_search with max_rows > 500. "
-            "Provide filters or reduce max_rows."
+            "Missing CKAN resource id in config.py. Expected PSES_DATASTORE_RESOURCE_ID to be set."
         )
 
-    page_size = max(1, min(int(page_size), 10_000))
     max_rows = int(max_rows)
+    page_size = int(page_size)
+    if max_rows <= 0:
+        return pd.DataFrame()
+    if page_size <= 0:
+        page_size = 1_000
 
-    records: List[Dict[str, Any]] = []
+    target = int(stop_after_rows) if stop_after_rows is not None else None
+    if target is not None and target <= 0:
+        target = None
+
+    all_records: List[Dict[str, Any]] = []
     offset = 0
 
-    while offset < max_rows:
-        limit = min(page_size, max_rows - offset)
+    # Hard cap to avoid runaway loops in case CKAN misbehaves
+    # (keeps the app responsive even if total is huge)
+    hard_page_cap = max(1, (max_rows // page_size) + 5)
 
-        page = _datastore_search(
+    pages = 0
+    while True:
+        pages += 1
+        if pages > hard_page_cap:
+            break
+
+        limit = min(page_size, max_rows - len(all_records))
+        if limit <= 0:
+            break
+
+        page = _ckan_datastore_search(
             resource_id=rid,
             filters=filters,
             fields=fields,
             sort=sort,
-            limit=limit,
             offset=offset,
-            include_total=include_total,
+            limit=limit,
             timeout_seconds=timeout_seconds,
+            include_total=include_total,
         )
 
-        if not page.records:
+        recs = page.records
+        if not recs:
             break
 
-        records.extend(page.records)
+        all_records.extend(recs)
 
-        if len(page.records) < limit:
+        # EARLY STOP (performance): quit as soon as we have enough
+        if target is not None and len(all_records) >= target:
             break
 
-        offset += limit
-        time.sleep(0.05)
+        if len(all_records) >= max_rows:
+            break
 
-    if not records:
+        offset += len(recs)
+
+        # If CKAN returns fewer than requested, we reached the end
+        if len(recs) < limit:
+            break
+
+    if not all_records:
         return pd.DataFrame()
 
-    return pd.DataFrame.from_records(records)
+    df = pd.DataFrame.from_records(all_records)
+    return df
 
 
-def get_available_survey_years(
+def get_available_survey_years() -> List[int]:
+    """
+    IMPORTANT: We do NOT scan the full dataset (15M+ rows) to discover years.
+    open.canada.ca does not provide datastore_search_sql, so DISTINCT queries are not available.
+
+    For prototype correctness + speed, keep the known cycles here.
+    If cycles change, update this list (or later wire a lightweight metadata source).
+    """
+    return [2019, 2020, 2022, 2024]
+
+
+def timed_ckan_query(
     *,
-    timeout_seconds: int = 60,
+    filters: Optional[Dict[str, Any]],
+    fields: Optional[List[str]] = None,
+    sort: Optional[str] = None,
+    max_rows: int = 5_000,
+    page_size: int = 1_000,
+    timeout_seconds: int = 90,
+    include_total: bool = False,
     resource_id: Optional[str] = None,
-    max_scan_rows: int = 50_000,
-    page_size: int = 5_000,
-) -> List[int]:
+    stop_after_rows: Optional[int] = None,
+) -> Tuple[pd.DataFrame, float]:
     """
-    Discover available SURVEYR values WITHOUT SQL.
-
-    We sample a limited number of rows requesting only SURVEYR and return distinct years.
-    This avoids scanning the full 15M+ table.
+    Convenience helper for UI timing logs.
     """
-    rid = _resolve_resource_id(resource_id)
-
-    years: set[int] = set()
-    offset = 0
-    page_size = max(100, min(int(page_size), 10_000))
-    max_scan_rows = max(1_000, int(max_scan_rows))
-
-    while offset < max_scan_rows:
-        page = _datastore_search(
-            resource_id=rid,
-            filters=None,
-            fields=["SURVEYR"],
-            sort=None,
-            limit=page_size,
-            offset=offset,
-            include_total=False,
-            timeout_seconds=timeout_seconds,
-        )
-
-        if not page.records:
-            break
-
-        for r in page.records:
-            v = r.get("SURVEYR")
-            try:
-                years.add(int(v))
-            except Exception:
-                continue
-
-        # If years stabilize quickly, stop early (heuristic)
-        if len(years) >= 4:
-            # For current dataset this is typically enough; keep it conservative.
-            pass
-
-        offset += page_size
-
-    return sorted(years)
+    t0 = time.perf_counter()
+    df = query_pses_results(
+        filters=filters,
+        fields=fields,
+        sort=sort,
+        max_rows=max_rows,
+        page_size=page_size,
+        timeout_seconds=timeout_seconds,
+        include_total=include_total,
+        resource_id=resource_id,
+        stop_after_rows=stop_after_rows,
+    )
+    return df, (time.perf_counter() - t0)
