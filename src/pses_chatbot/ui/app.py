@@ -275,10 +275,6 @@ def _render_analytical_query_tester() -> None:
                 value=default_years_str,
             )
 
-            # Demographic selection: Category dropdown + optional subgroup dropdown.
-            # - No category => overall
-            # - Category only => all subgroups (multi-demcode query)
-            # - Category + subgroup => single demcode
             demcode_value: Optional[str] = None
             demcodes_value: Optional[List[str]] = None
 
@@ -311,7 +307,6 @@ def _render_analytical_query_tester() -> None:
                     subset = d[(d["category_en"] == cat_choice) & (d["demcode"] != "")].copy()
                     subset = subset.sort_values(["label_en", "demcode"])
 
-                    # Optional subgroup selection
                     subgroup_options = ["All subgroups"] + [
                         f"{r['label_en']} ({r['demcode']})"
                         for _, r in subset.iterrows()
@@ -321,7 +316,6 @@ def _render_analytical_query_tester() -> None:
                     sub_choice = st.selectbox("Demographic subgroup (optional):", options=subgroup_options, index=0)
 
                     if sub_choice == "All subgroups":
-                        # Category-only query => multi-demcode
                         demcodes_value = subset["demcode"].tolist()
                         demcode_value = None
                     else:
@@ -373,7 +367,7 @@ def _render_analytical_query_tester() -> None:
 
                 status.write(
                     f"Resolved params: years={params.survey_years}, "
-                    f"question={params.question_code}, demcode={params.demcode!r}, demcodes={'(multi)' if params.demcodes else None}, "
+                    f"question={params.question_code}, demcode={params.demcode!r}, demcodes={'(list)' if params.demcodes else None}, "
                     f"org={params.org_levels}"
                 )
 
@@ -398,7 +392,6 @@ def _render_analytical_query_tester() -> None:
                 st.write(f"Question: {result.params.question_code} — {result.question_label_en}")
                 st.write(f"Organization: {result.org_label_en or '(label not found)'}")
 
-                # Demographic header line
                 if result.params.demcodes:
                     st.write("Demographic: Category (all subgroups)")
                 else:
@@ -410,14 +403,35 @@ def _render_analytical_query_tester() -> None:
                         else:
                             st.write(f"Demographic: {result.dem_label_en or result.params.demcode}")
 
-                # Supporting metrics table
+                # ---- LABEL FIX: never show DEMCODEs in the table ----
+                dem_lookup = {}
+                try:
+                    dm = load_demographics_meta(refresh=False)
+                    if dm is not None and not dm.empty and "demcode" in dm.columns:
+                        dm2 = dm.copy()
+                        dm2["demcode"] = dm2["demcode"].astype(str).str.strip()
+                        dm2["label_en"] = dm2.get("label_en", "").astype(str).str.strip()
+                        dm2["category_en"] = dm2.get("category_en", "").astype(str).str.strip()
+                        dem_lookup = {
+                            r["demcode"]: {"label_en": r.get("label_en", ""), "category_en": r.get("category_en", "")}
+                            for _, r in dm2.iterrows()
+                            if r.get("demcode", "").strip() != ""
+                        }
+                except Exception:
+                    dem_lookup = {}
+
                 if result.metrics_by_demcode:
                     rows = []
                     for dem, metrics in result.metrics_by_demcode.items():
+                        info = dem_lookup.get(str(dem).strip(), {})
+                        subgroup_label = info.get("label_en", "").strip() or "(Unknown subgroup)"
+                        category_label = info.get("category_en", "").strip()
+
                         for m in metrics:
                             rows.append(
                                 {
-                                    "DEMCODE": dem,
+                                    "Category": category_label,
+                                    "Subgroup": subgroup_label,
                                     "Year": m.year,
                                     "Value (Most positive / least negative)": m.value,
                                     "Δ vs previous year": m.delta_vs_prev,
