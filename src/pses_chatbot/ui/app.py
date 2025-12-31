@@ -262,6 +262,44 @@ def _render_metadata_status() -> None:
                 st.code(repr(e))
 
 
+def _build_dem_lookup_en() -> Dict[str, Dict[str, str]]:
+    """
+    Returns demcode -> {label_en, category_en}
+    Uses normalized columns when available; falls back to raw columns if needed.
+    """
+    dm = load_demographics_meta(refresh=False)
+    if dm is None or dm.empty:
+        return {}
+
+    dm2 = dm.copy()
+    dm2.columns = [str(c).strip() for c in dm2.columns]
+
+    # Preferred normalized columns
+    demcode_col = "demcode" if "demcode" in dm2.columns else ("DEMCODE 2024" if "DEMCODE 2024" in dm2.columns else None)
+    label_col = "label_en" if "label_en" in dm2.columns else ("DESCRIP_E" if "DESCRIP_E" in dm2.columns else None)
+    cat_col = "category_en" if "category_en" in dm2.columns else ("Category_E" if "Category_E" in dm2.columns else None)
+
+    if demcode_col is None:
+        return {}
+
+    dm2[demcode_col] = dm2[demcode_col].astype(str).str.strip()
+    if label_col is not None:
+        dm2[label_col] = dm2[label_col].astype(str).str.strip()
+    if cat_col is not None:
+        dm2[cat_col] = dm2[cat_col].astype(str).str.strip()
+
+    out: Dict[str, Dict[str, str]] = {}
+    for _, r in dm2.iterrows():
+        code = str(r.get(demcode_col, "")).strip()
+        if not code:
+            continue
+        out[code] = {
+            "label_en": str(r.get(label_col, "")).strip() if label_col else "",
+            "category_en": str(r.get(cat_col, "")).strip() if cat_col else "",
+        }
+    return out
+
+
 def _render_analytical_query_tester() -> None:
     with st.expander("Analytical query test (developer view)", expanded=True):
         default_years_str = ",".join(str(y) for y in DEFAULT_SURVEY_YEARS)
@@ -365,11 +403,24 @@ def _render_analytical_query_tester() -> None:
                     org_levels=org_levels,
                 )
 
+                # Developer debug: show EXACT demcodes passed
+                demcodes_count = len(params.demcodes) if params.demcodes else 0
+                demcodes_preview = params.demcodes[:25] if params.demcodes else None
+                is_truncated = bool(params.demcodes and len(params.demcodes) > 25)
+
                 status.write(
-                    f"Resolved params: years={params.survey_years}, "
-                    f"question={params.question_code}, demcode={params.demcode!r}, demcodes={'(list)' if params.demcodes else None}, "
-                    f"org={params.org_levels}"
+                    "Resolved params:\n"
+                    f"- years={params.survey_years}\n"
+                    f"- question={params.question_code}\n"
+                    f"- demcode={params.demcode!r}\n"
+                    f"- demcodes_count={demcodes_count}\n"
+                    f"- demcodes_preview={demcodes_preview}{' (truncated)' if is_truncated else ''}\n"
+                    f"- org={params.org_levels}"
                 )
+
+                if params.demcodes:
+                    with st.expander("Developer: DEMCODEs passed to CKAN (full list)", expanded=False):
+                        st.text_area("DEMCODE list", value=", ".join(params.demcodes), height=120)
 
                 status.update(label="Step 1/2 — Running CKAN analytical query…", state="running")
 
@@ -378,11 +429,10 @@ def _render_analytical_query_tester() -> None:
                 t2 = time.perf_counter()
                 status.write(f"CKAN query completed in {t2 - t1:0.2f}s (total elapsed {t2 - t0:0.2f}s)")
 
-                snapshot = None
                 if run_audit and build_audit_snapshot is not None:
                     status.update(label="Step 2/2 — Building audit snapshot…", state="running")
                     t3 = time.perf_counter()
-                    snapshot = build_audit_snapshot(result)
+                    _ = build_audit_snapshot(result)
                     t4 = time.perf_counter()
                     status.write(f"Audit snapshot completed in {t4 - t3:0.2f}s (total elapsed {t4 - t0:0.2f}s)")
 
@@ -399,26 +449,23 @@ def _render_analytical_query_tester() -> None:
                         st.write("Demographic: Overall (no breakdown)")
                     else:
                         if result.dem_category_en:
-                            st.write(f"Demographic: {result.dem_category_en} — {result.dem_label_en or result.params.demcode}")
+                            st.write(f"Demographic: {result.dem_category_en} — {result.dem_label_en or '(label not found)'}")
                         else:
-                            st.write(f"Demographic: {result.dem_label_en or result.params.demcode}")
+                            st.write(f"Demographic: {result.dem_label_en or '(label not found)'}")
 
-                # ---- LABEL FIX: never show DEMCODEs in the table ----
-                dem_lookup = {}
-                try:
-                    dm = load_demographics_meta(refresh=False)
-                    if dm is not None and not dm.empty and "demcode" in dm.columns:
-                        dm2 = dm.copy()
-                        dm2["demcode"] = dm2["demcode"].astype(str).str.strip()
-                        dm2["label_en"] = dm2.get("label_en", "").astype(str).str.strip()
-                        dm2["category_en"] = dm2.get("category_en", "").astype(str).str.strip()
-                        dem_lookup = {
-                            r["demcode"]: {"label_en": r.get("label_en", ""), "category_en": r.get("category_en", "")}
-                            for _, r in dm2.iterrows()
-                            if r.get("demcode", "").strip() != ""
-                        }
-                except Exception:
-                    dem_lookup = {}
+                # Label mapping (English only for developer UI)
+                dem_lookup = _build_dem_lookup_en()
+
+                # Also show the subgroup labels used (labels only, no codes)
+                if result.params.demcodes:
+                    labels_used = []
+                    for code in result.params.demcodes:
+                        lbl = dem_lookup.get(str(code).strip(), {}).get("label_en", "").strip()
+                        if lbl:
+                            labels_used.append(lbl)
+                    labels_used = sorted(set(labels_used))
+                    if labels_used:
+                        st.write("Subgroups included (labels): " + ", ".join(labels_used))
 
                 if result.metrics_by_demcode:
                     rows = []
