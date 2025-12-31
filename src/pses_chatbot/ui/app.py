@@ -72,8 +72,7 @@ def main() -> None:
                 value=default_years_str,
             )
 
-            # Demographic selector (Category → Subgroup). This prevents accidentally pulling
-            # all demographic rows when the user intends the overall (blank DEMCODE) row.
+            # Demographic selector (Category → Subgroup)
             dem_meta = None
             try:
                 dem_meta = load_demographics_meta(refresh=False)
@@ -82,7 +81,12 @@ def main() -> None:
 
             demcode_input = ""
 
-            if dem_meta is None or dem_meta.empty or ("category_en" not in dem_meta.columns) or ("demcode" not in dem_meta.columns):
+            if (
+                dem_meta is None
+                or dem_meta.empty
+                or "category_en" not in dem_meta.columns
+                or "demcode" not in dem_meta.columns
+            ):
                 st.warning(
                     "Demographics metadata is missing category information. Falling back to manual DEMCODE entry."
                 )
@@ -103,18 +107,16 @@ def main() -> None:
                     "Demographic category:",
                     options=mode_options,
                     index=0,
-                    help="Choose Overall to retrieve the single overall row (blank DEMCODE). Choose a category to select a specific subgroup.",
                 )
 
                 if selected_category == "Overall (DEMCODE blank)":
                     demcode_input = ""
-                    st.caption("Overall selected: query will isolate rows where DEMCODE is blank (overall, no breakdown).")
+                    st.caption("Overall selected: isolates rows where DEMCODE is blank.")
                 else:
                     subset = dem_meta2[dem_meta2["category_en"] == selected_category].copy()
                     subset = subset[subset["demcode"].astype(str).str.strip() != ""]
                     subset = subset.sort_values(["label_en", "demcode"])
 
-                    # Display labels; store demcode
                     label_map = {
                         f"{row['label_en']} ({row['demcode']})": row["demcode"]
                         for _, row in subset.iterrows()
@@ -130,29 +132,19 @@ def main() -> None:
                             "Subgroup:",
                             options=subgroup_labels,
                             index=0,
-                            help="This will apply a DEMCODE equality filter in CKAN.",
                         )
                         demcode_input = label_map.get(selected_subgroup, "")
 
             run_audit = st.checkbox(
                 "Run audit snapshot (optional)",
                 value=False,
-                help="Off by default for basic query testing. If enabled, builds audit facts from the returned rows.",
             )
 
             if run_audit and build_audit_snapshot is None:
-                st.warning("Audit snapshot is not available (pses_chatbot.core.audit import failed).")
+                st.warning("Audit snapshot module is not available.")
 
         with col2:
-            try:
-                org_raw = load_org_meta(refresh=False)
-            except Exception:
-                org_raw = pd.DataFrame()
-
-            st.write("Organization (default PS-wide unless you select otherwise):")
-            # Your org cascade UI is already working; leaving it untouched here.
-            # This tester assumes org_levels are managed as before.
-            # Minimal fallback:
+            st.write("Organization (default PS-wide):")
             org_levels = {
                 "LEVEL1ID": 0,
                 "LEVEL2ID": 0,
@@ -160,7 +152,7 @@ def main() -> None:
                 "LEVEL4ID": 0,
                 "LEVEL5ID": 0,
             }
-            st.caption("Org cascade UI is baseline working; not modified in this patch.")
+            st.caption("Org cascade UI unchanged.")
 
         st.divider()
 
@@ -170,76 +162,36 @@ def main() -> None:
 
             try:
                 years = _parse_years(years_str, default_years)
-
-                # Normalize DEMCODE input
-                demcode = demcode_input.strip() if isinstance(demcode_input, str) else ""
-                demcode_param = demcode if demcode != "" else None
+                demcode = demcode_input.strip() if demcode_input else None
 
                 params = QueryParameters(
                     question_code=str(question_code).strip(),
                     survey_years=years,
                     org_levels=org_levels,
-                    demcode=demcode_param,
+                    demcode=demcode,
                 )
 
-                t1 = time.perf_counter()
                 result = run_analytical_query(params)
-                t2 = time.perf_counter()
-                status.write(f"CKAN query completed in {t2 - t1:0.2f}s (total elapsed {t2 - t0:0.2f}s)")
 
-                snapshot = None
-                if run_audit and build_audit_snapshot is not None:
-                    status.update(label="Step 2/2 — Building audit snapshot…", state="running")
-                    t3 = time.perf_counter()
-                    snapshot = build_audit_snapshot(result)
-                    t4 = time.perf_counter()
-                    status.write(f"Audit snapshot completed in {t4 - t3:0.2f}s (total elapsed {t4 - t0:0.2f}s)")
+                status.update(label="Query completed.", state="complete")
 
-                status.update(label="Done.", state="complete")
+                st.success("Analytical query succeeded.")
+                st.write(f"Question: {result.question_label_en}")
+                st.write(f"Organization: {result.org_label_en or 'Public Service'}")
 
-                if snapshot is None:
-                    st.success("Analytical query succeeded.")
-                    st.write(f"Question: {result.params.question_code} — {result.question_label_en}")
-                    st.write(f"Organization: {result.org_label_en or '(label not found)'}")
-                    demo = "Overall (no breakdown)"
-                    if result.params.demcode and str(result.params.demcode).strip() != "":
-                        cat = result.dem_category_en or ""
-                        lab = result.dem_label_en or ""
-                        code = str(result.params.demcode).strip()
-                        if cat and lab:
-                            demo = f"{cat} — {lab} ({code})"
-                        elif lab:
-                            demo = f"{lab} ({code})"
-                        else:
-                            demo = f"DEMCODE {code}"
-                    st.write(f"Demographic: {demo}")
+                if result.demcode:
+                    st.write(
+                        f"Demographic: {result.dem_category_en} — {result.dem_label_en} ({result.demcode})"
+                    )
                 else:
-                    st.success("Analytical query + audit snapshot succeeded.")
-                    st.write(f"Question: {snapshot.question_code} — {snapshot.question_label_en}")
-                    st.write(f"Organization: {snapshot.org_label_en or '(label not found)'}")
-                    demo = "Overall (no breakdown)"
-                    snap_code = getattr(snapshot, "demcode", None)
-                    if snap_code is None:
-                        snap_code = result.params.demcode
-                    if snap_code and str(snap_code).strip() != "":
-                        cat = getattr(snapshot, "dem_category_en", None) or result.dem_category_en or ""
-                        lab = getattr(snapshot, "dem_label_en", None) or result.dem_label_en or ""
-                        code = str(snap_code).strip()
-                        if cat and lab:
-                            demo = f"{cat} — {lab} ({code})"
-                        elif lab:
-                            demo = f"{lab} ({code})"
-                        else:
-                            demo = f"DEMCODE {code}"
-                    st.write(f"Demographic: {demo}")
-                    st.write(f"Metric: {snapshot.metric_name_en}")
+                    st.write("Demographic: Overall (no breakdown)")
 
                 rows = []
                 for m in result.yearly_metrics:
                     rows.append(
                         {
                             "Year": m.year,
-                            "Value (Most positive / least negative)": m.value,
+                            "Most positive / least negative": m.value,
                             "Δ vs previous year": m.delta_vs_prev,
                         }
                     )
@@ -251,12 +203,14 @@ def main() -> None:
                 status.update(label="Query failed.", state="error")
                 st.error(str(e))
 
-            except Exception as e:
-                status.update(label="Query failed.", state="error")
-                st.error("Unexpected error.")
+            except Exception:
+                status.update(label="Unexpected error.", state="error")
                 st.code(traceback.format_exc())
 
-    st.caption("Baseline rules: no aggregation; POSITIVE only; overall = blank DEMCODE filtered locally.")
+
+# ✅ REQUIRED BY main.py
+def run_app() -> None:
+    main()
 
 
 if __name__ == "__main__":
