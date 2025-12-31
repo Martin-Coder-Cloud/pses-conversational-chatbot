@@ -1,58 +1,41 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional
-
 import logging
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 
 from pses_chatbot.core.data_loader import query_pses_results
 from pses_chatbot.core.metadata_loader import (
-    load_questions_meta,
-    load_org_meta,
     load_demographics_meta,
+    load_org_meta,
+    load_questions_meta,
 )
 
 logger = logging.getLogger(__name__)
 
-# Column names in the PSES DataStore
-SURVEY_YEAR_COL = "SURVEYR"
-QUESTION_COL = "QUESTION"
-DEMCODE_COL = "DEMCODE"
 
-# The API table uses standardized metric columns:
-# POSITIVE / NEUTRAL / NEGATIVE / AGREE / SCORE5 / SCORE100 / ANSCOUNT
-# Your business rule "MOST POSITIVE OR LEAST NEGATIVE" corresponds to POSITIVE.
-PRIMARY_METRIC_COL = "POSITIVE"
-ALT_METRIC_COLS = [
-    "MOST POSITIVE OR LEAST NEGATIVE",  # (older/local naming)
-    "MOST_POSITIVE_OR_LEAST_NEGATIVE",  # just in case
-]
-
-ANSCOUNT_COL = "ANSCOUNT"
-LEVEL_COLS = ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]
-
-
-class QueryEngineError(Exception):
-    """Custom exception for query engine failures."""
+class QueryEngineError(RuntimeError):
+    pass
 
 
 @dataclass
 class QueryParameters:
     """
-    Structured parameters required to query the PSES DataStore.
+    Canonical analytical query parameters.
 
-    Rules:
-      - survey_years: explicit list (UI defaults to all cycles)
-      - question_code: required (e.g., 'Q08')
-      - demcode:
-          * None => overall / no breakdown.
-            IMPORTANT: CKAN datastore_search cannot reliably filter for blank cells.
+    - survey_years: list of years (2019/2020/2022/2024)
+    - question_code: e.g. "Q08" (matches QUESTION in CKAN)
+    - demcode:
+        * None => overall baseline
+            CKAN cannot reliably filter on empty DEMCODE.
             Therefore overall is implemented as:
               - query WITHOUT DEMCODE filter
               - then filter locally where DEMCODE is blank/NULL/whitespace
           * str  => specific demographic code (filter equality at CKAN level)
-      - org_levels: required explicit LEVEL1ID..LEVEL5ID integers
+    - org_levels: required explicit LEVEL1ID..LEVEL5ID integers
     """
     survey_years: List[int]
     question_code: str
@@ -80,6 +63,8 @@ class QueryResult:
     org_label_fr: str | None
     dem_label_en: str | None
     dem_label_fr: str | None
+    dem_category_en: str | None
+    dem_category_fr: str | None
     metric_col_used: str  # NEW: which metric column we used (POSITIVE, etc.)
 
 
@@ -100,31 +85,34 @@ def _lookup_question_labels(question_code: str) -> Tuple[str, str]:
 
 
 def _lookup_org_labels(org_levels: Dict[str, int]) -> Tuple[str | None, str | None]:
-    if not org_levels:
-        raise QueryEngineError("org_levels is empty. LEVEL1ID..LEVEL5ID must be specified.")
-
     org_meta = load_org_meta()
-
-    mask = pd.Series([True] * len(org_meta))
-    for col in LEVEL_COLS:
-        if col in org_levels:
-            mask = mask & (org_meta[col] == int(org_levels[col]))
-
-    matched = org_meta[mask]
-    if matched.empty:
-        logger.warning("Org levels %s did not match any row in org metadata.", org_levels)
+    if org_meta is None or org_meta.empty:
         return None, None
 
-    row = matched.iloc[0]
+    df = org_meta.copy()
+    for c in ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    mask = pd.Series([True] * len(df))
+    for c in ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]:
+        if c in df.columns:
+            mask = mask & (df[c] == int(org_levels.get(c, 0)))
+
+    row = df[mask]
+    if row.empty:
+        return None, None
+
+    r = row.iloc[0]
     return (
-        str(row.get("org_name_en", "")).strip() or None,
-        str(row.get("org_name_fr", "")).strip() or None,
+        str(r.get("org_name_en", "")).strip() or None,
+        str(r.get("org_name_fr", "")).strip() or None,
     )
 
 
-def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None]:
+def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None, str | None, str | None]:
     if demcode is None or str(demcode).strip() == "":
-        return "Overall (no breakdown)", "Ensemble (sans ventilation)"
+        return "Overall (no breakdown)", "Ensemble (sans ventilation)", None, None
 
     code = str(demcode).strip()
     dem_meta = load_demographics_meta()
@@ -132,12 +120,12 @@ def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None]:
     col_name = "demcode" if "demcode" in dem_meta.columns else ("code" if "code" in dem_meta.columns else None)
     if col_name is None:
         logger.warning("Demographics metadata has no demcode/code column. Cannot label DEMCODE=%s.", code)
-        return None, None
+        return None, None, None, None
 
     row = dem_meta[dem_meta[col_name].astype(str) == code]
     if row.empty:
         logger.warning("DEMCODE %s not found in DEMCODE metadata.", code)
-        return None, None
+        return None, None, None, None
 
     r = row.iloc[0]
     en_col = "label_en" if "label_en" in r.index else ("DESCRIP_E" if "DESCRIP_E" in r.index else None)
@@ -145,7 +133,10 @@ def _lookup_dem_labels(demcode: Optional[str]) -> Tuple[str | None, str | None]:
 
     label_en = str(r.get(en_col, "")).strip() if en_col else ""
     label_fr = str(r.get(fr_col, "")).strip() if fr_col else ""
-    return (label_en or None, label_fr or None)
+
+    cat_en = str(r.get("category_en", "")).strip() if "category_en" in r.index else ""
+    cat_fr = str(r.get("category_fr", "")).strip() if "category_fr" in r.index else ""
+    return (label_en or None, label_fr or None, cat_en or None, cat_fr or None)
 
 
 # ---------------------------------------------------------------------------
@@ -168,214 +159,125 @@ def _validate_years(requested: List[int]) -> List[int]:
             continue
     cleaned = sorted(set(cleaned))
     if not cleaned:
-        raise QueryEngineError("SURVEYR list must contain at least one valid year.")
-
-    known_set = set(_known_survey_years())
-    intersection = [y for y in cleaned if y in known_set]
-    return intersection if intersection else cleaned
+        raise QueryEngineError("No valid survey years provided.")
+    unknown = [y for y in cleaned if y not in _known_survey_years()]
+    if unknown:
+        raise QueryEngineError(f"Unknown survey years requested: {unknown}. Known: {_known_survey_years()}")
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
-# Metric column resolution
+# CKAN query + analytical logic
 # ---------------------------------------------------------------------------
 
-def _resolve_metric_column(df: pd.DataFrame) -> str:
+def run_analytical_query(params: QueryParameters) -> QueryResult:
     """
-    Resolve which column represents the business metric:
-    "Most positive or least negative".
-
-    On open.canada.ca DataStore, this is POSITIVE.
+    Enforces:
+      - no aggregation
+      - expects exactly one row per year for overall (blank DEMCODE) OR specific subgroup DEMCODE
+      - uses POSITIVE as the "most positive / least negative" metric
     """
-    if PRIMARY_METRIC_COL in df.columns:
-        return PRIMARY_METRIC_COL
-    for c in ALT_METRIC_COLS:
-        if c in df.columns:
-            return c
-    raise QueryEngineError(
-        f"Required metric column not found. Expected '{PRIMARY_METRIC_COL}' "
-        f"(or one of {ALT_METRIC_COLS}). Present columns: {list(df.columns)}"
-    )
+    t0 = time.perf_counter()
 
+    years = _validate_years(params.survey_years)
+    question_code = str(params.question_code).strip().upper()
+    demcode = None if params.demcode is None or str(params.demcode).strip() == "" else str(params.demcode).strip()
 
-# ---------------------------------------------------------------------------
-# CKAN query helpers
-# ---------------------------------------------------------------------------
-
-def _build_filters_base(params: QueryParameters, year: int) -> Dict[str, Any]:
-    if not params.question_code:
-        raise QueryEngineError("QUESTION (question_code) must be specified.")
-    if not params.org_levels:
-        raise QueryEngineError("org_levels must always be specified (LEVEL1ID..LEVEL5ID).")
-
+    # Build CKAN filters (do NOT include DEMCODE when overall)
     filters: Dict[str, Any] = {
-        QUESTION_COL: str(params.question_code).strip(),
-        SURVEY_YEAR_COL: int(year),
+        "QUESTION": question_code,
     }
+    for c in ["LEVEL1ID", "LEVEL2ID", "LEVEL3ID", "LEVEL4ID", "LEVEL5ID"]:
+        filters[c] = int(params.org_levels.get(c, 0))
 
-    for col in LEVEL_COLS:
-        if col in params.org_levels:
-            filters[col] = int(params.org_levels[col])
+    if demcode is not None:
+        filters["DEMCODE"] = demcode
 
-    return filters
-
-
-def _is_overall_demcode_value(x: Any) -> bool:
-    """
-    Overall/no breakdown row is represented by DEMCODE blank.
-    Treat None, NaN, "", and whitespace-only as overall.
-    """
-    if x is None:
-        return True
-    try:
-        if pd.isna(x):
-            return True
-    except Exception:
-        pass
-    return str(x).strip() == ""
-
-
-def _fetch_one_year(params: QueryParameters, year: int, max_rows_per_year: int) -> pd.DataFrame:
-    base_filters = _build_filters_base(params, year)
-
-    # Case A: specific demographic requested
-    if params.demcode is not None and str(params.demcode).strip() != "":
-        base_filters[DEMCODE_COL] = str(params.demcode).strip()
-
-        return query_pses_results(
-            filters=base_filters,
-            fields=None,
-            sort=None,
-            max_rows=max_rows_per_year,
-            page_size=min(max_rows_per_year, 10_000),
-            timeout_seconds=120,
-            include_total=False,
-        )
-
-    # Case B: overall requested (demcode None)
-    df_all = query_pses_results(
-        filters=base_filters,
+    # Pull a slice (never the whole dataset)
+    df = query_pses_results(
+        filters=filters,
         fields=None,
         sort=None,
-        max_rows=max_rows_per_year,
-        page_size=min(max_rows_per_year, 10_000),
+        max_rows=5000,
+        page_size=1000,
         timeout_seconds=120,
         include_total=False,
     )
 
-    if df_all.empty:
-        return df_all
+    if df is None or df.empty:
+        raise QueryEngineError("No rows returned from CKAN for the requested parameters.")
 
-    if DEMCODE_COL not in df_all.columns:
-        raise QueryEngineError(
-            f"Returned slice does not contain '{DEMCODE_COL}' column; cannot isolate overall row."
-        )
+    # Local filter for overall rows (blank DEMCODE)
+    if demcode is None:
+        if "DEMCODE" not in df.columns:
+            raise QueryEngineError("Returned data is missing DEMCODE column (required for overall filtering).")
+        df["__dem_blank__"] = df["DEMCODE"].astype(str).fillna("").str.strip()
+        df = df[df["__dem_blank__"] == ""].copy()
+        df.drop(columns=["__dem_blank__"], inplace=True, errors="ignore")
 
-    return df_all[df_all[DEMCODE_COL].apply(_is_overall_demcode_value)].copy()
+    # Filter years locally (CKAN cannot do IN reliably with datastore_search)
+    if "SURVEY_YEAR" not in df.columns:
+        raise QueryEngineError("Returned data is missing SURVEY_YEAR column.")
+    df["SURVEY_YEAR"] = pd.to_numeric(df["SURVEY_YEAR"], errors="coerce").astype("Int64")
+    df = df[df["SURVEY_YEAR"].isin(years)].copy()
 
-
-def _fetch_raw_slice(params: QueryParameters, max_rows_per_year: int = 50_000) -> pd.DataFrame:
-    if not params.survey_years:
-        raise QueryEngineError("SURVEYR list must be specified (at least one year).")
-
-    years = _validate_years(params.survey_years)
-
-    frames: List[pd.DataFrame] = []
-    for y in years:
-        logger.info(
-            "Querying PSES DataStore for year=%s (question=%s, demcode=%s, org=%s)",
-            y, params.question_code, params.demcode, params.org_levels
-        )
-        df_y = _fetch_one_year(params, year=y, max_rows_per_year=max_rows_per_year)
-        frames.append(df_y)
-
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if df.empty:
-        raise QueryEngineError("Combined slice is empty after querying all years.")
+        raise QueryEngineError("No rows remain after local filtering for years/overall-demcode.")
 
-    return df
+    # Core metric column
+    metric_col_used = "POSITIVE"
+    if metric_col_used not in df.columns:
+        raise QueryEngineError("Returned data is missing POSITIVE column (required).")
 
-
-def _extract_yearly_metrics(df: pd.DataFrame) -> Tuple[List[YearlyMetric], str]:
-    """
-    Extract the POSITIVE metric by year (no aggregation).
-    Returns (metrics, metric_col_used).
-    """
-    if SURVEY_YEAR_COL not in df.columns:
+    # Enforce one row per year
+    counts = df.groupby("SURVEY_YEAR").size().to_dict()
+    bad = {int(k): int(v) for k, v in counts.items() if int(v) != 1}
+    if bad:
         raise QueryEngineError(
-            f"Required column missing from slice: {SURVEY_YEAR_COL}. Present: {list(df.columns)}"
+            "No aggregation permitted, but multiple rows found for some years. "
+            f"Expected 1 row per year; got: {bad}"
         )
 
-    metric_col = _resolve_metric_column(df)
+    df = df.sort_values("SURVEY_YEAR").reset_index(drop=True)
 
-    # Expect exactly 1 row per year (after DEMCODE handling)
-    counts = df.groupby(SURVEY_YEAR_COL).size()
-    problematic = counts[counts > 1]
-    if not problematic.empty:
-        raise QueryEngineError(
-            "Multiple rows per year found for the given QUESTION/DEMCODE/org levels. "
-            "Aggregation is not permitted. "
-            f"Problematic years: {problematic.to_dict()}"
-        )
-
-    work_cols = [SURVEY_YEAR_COL, metric_col]
-    if ANSCOUNT_COL in df.columns:
-        work_cols.append(ANSCOUNT_COL)
-
-    work = df[work_cols].copy().sort_values(SURVEY_YEAR_COL)
-
-    metrics: List[YearlyMetric] = []
-    prev_value: float | None = None
-
-    for _, row in work.iterrows():
-        year = int(row[SURVEY_YEAR_COL])
-
+    # Build yearly metrics (no aggregation; one row per year)
+    yearly_metrics: List[YearlyMetric] = []
+    prev_val: Optional[float] = None
+    for _, row in df.iterrows():
+        year = int(row["SURVEY_YEAR"])
         try:
-            value = float(row[metric_col])
+            val = float(row[metric_col_used])
         except Exception:
-            value = float("nan")
+            raise QueryEngineError(f"POSITIVE is not numeric for year {year}.")
 
-        n: int | None = None
-        if ANSCOUNT_COL in row.index:
+        n_val = None
+        if "ANSCOUNT" in df.columns:
             try:
-                n_val = row.get(ANSCOUNT_COL)
-                n = int(n_val) if pd.notna(n_val) else None
+                n_val = int(row["ANSCOUNT"])
             except Exception:
-                n = None
+                n_val = None
 
         delta = None
-        if prev_value is not None and pd.notna(value):
-            delta = value - prev_value
+        if prev_val is not None:
+            delta = val - prev_val
 
-        metrics.append(YearlyMetric(year=year, value=value, delta_vs_prev=delta, n=n))
-        if pd.notna(value):
-            prev_value = value
+        yearly_metrics.append(YearlyMetric(year=year, value=val, delta_vs_prev=delta, n=n_val))
+        prev_val = val
 
-    return metrics, metric_col
+    overall_delta = None
+    if len(yearly_metrics) >= 2:
+        overall_delta = yearly_metrics[-1].value - yearly_metrics[0].value
 
-
-def _compute_overall_delta(metrics: List[YearlyMetric]) -> float | None:
-    if len(metrics) < 2:
-        return None
-    valid = [m for m in metrics if pd.notna(m.value)]
-    if len(valid) < 2:
-        return None
-    return valid[-1].value - valid[0].value
-
-
-def run_analytical_query(params: QueryParameters) -> QueryResult:
-    logger.info("Running analytical query with params=%s", params)
-
-    raw_df = _fetch_raw_slice(params)
-    yearly_metrics, metric_col_used = _extract_yearly_metrics(raw_df)
-    overall_delta = _compute_overall_delta(yearly_metrics)
-
-    q_en, q_fr = _lookup_question_labels(params.question_code)
+    q_en, q_fr = _lookup_question_labels(question_code)
     org_en, org_fr = _lookup_org_labels(params.org_levels)
-    dem_en, dem_fr = _lookup_dem_labels(params.demcode)
+    dem_en, dem_fr, dem_cat_en, dem_cat_fr = _lookup_dem_labels(params.demcode)
+
+    t1 = time.perf_counter()
+    logger.info("Analytical query completed in %.2fs", t1 - t0)
 
     return QueryResult(
         params=params,
-        raw_df=raw_df,
+        raw_df=df,
         yearly_metrics=yearly_metrics,
         overall_delta=overall_delta,
         question_label_en=q_en,
@@ -384,5 +286,7 @@ def run_analytical_query(params: QueryParameters) -> QueryResult:
         org_label_fr=org_fr,
         dem_label_en=dem_en,
         dem_label_fr=dem_fr,
+        dem_category_en=dem_cat_en,
+        dem_category_fr=dem_cat_fr,
         metric_col_used=metric_col_used,
     )
