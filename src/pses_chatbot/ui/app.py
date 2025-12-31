@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -264,91 +264,6 @@ def _render_metadata_status() -> None:
                 st.code(repr(e))
 
 
-def _dem_ui_resolve_demcode_and_labels(demo_df: Optional[pd.DataFrame]) -> Tuple[Optional[str], str]:
-    """
-    Returns:
-      (demcode_value, ui_label)
-
-    demcode_value:
-      - None => overall (blank DEMCODE rows)
-      - "1234" => subgroup demcode
-    ui_label:
-      - user-friendly string for the selected demographic
-    """
-    # Fallback: manual DEMCODE entry
-    if demo_df is None or demo_df.empty:
-        demcode_input = st.text_input("DEMCODE (leave blank for overall/no breakdown):", value="")
-        demcode = demcode_input.strip()
-        demcode_value = None if demcode == "" else demcode
-        ui_label = "Overall (no breakdown)" if demcode_value is None else f"DEMCODE {demcode_value}"
-        return demcode_value, ui_label
-
-    df = demo_df.copy()
-
-    # Accept either normalized columns (preferred) or raw sheet columns.
-    # Normalized (new): demcode, label_en, category_en
-    # Raw (legacy): 'DEMCODE 2024', 'DESCRIP_E', 'Category_E'
-    if "demcode" in df.columns:
-        code_col = "demcode"
-    elif "DEMCODE 2024" in df.columns:
-        code_col = "DEMCODE 2024"
-    else:
-        code_col = ""
-
-    if "label_en" in df.columns:
-        label_col = "label_en"
-    elif "DESCRIP_E" in df.columns:
-        label_col = "DESCRIP_E"
-    else:
-        label_col = ""
-
-    if "category_en" in df.columns:
-        cat_col = "category_en"
-    elif "Category_E" in df.columns:
-        cat_col = "Category_E"
-    else:
-        cat_col = ""
-
-    # If we can’t find the necessary columns, fall back to manual
-    if not code_col or not label_col or not cat_col:
-        demcode_input = st.text_input("DEMCODE (leave blank for overall/no breakdown):", value="")
-        demcode = demcode_input.strip()
-        demcode_value = None if demcode == "" else demcode
-        ui_label = "Overall (no breakdown)" if demcode_value is None else f"DEMCODE {demcode_value}"
-        return demcode_value, ui_label
-
-    df[cat_col] = df[cat_col].apply(_normalize_text)
-    df[label_col] = df[label_col].apply(_normalize_text)
-    df[code_col] = df[code_col].apply(_normalize_text)
-
-    categories = sorted([c for c in df[cat_col].unique().tolist() if c])
-
-    options = ["Overall (DEMCODE blank)"] + categories
-    selected_category = st.selectbox("Demographic category", options=options, index=0)
-
-    if selected_category == "Overall (DEMCODE blank)":
-        return None, "Overall (no breakdown)"
-
-    subset = df[df[cat_col] == selected_category].copy()
-    subset = subset[subset[code_col] != ""]
-    subset = subset.sort_values([label_col, code_col])
-
-    # show: Label (code)
-    display = [f"{row[label_col]} ({row[code_col]})" for _, row in subset.iterrows() if row[label_col] and row[code_col]]
-    if not display:
-        st.warning(f"No subgroups found for category: {selected_category}")
-        return None, "Overall (no breakdown)"
-
-    selected_subgroup = st.selectbox("Subgroup", options=display, index=0)
-
-    # Extract code from "... (####)"
-    code = selected_subgroup.rsplit("(", 1)[-1].rstrip(")").strip()
-    if code == "":
-        return None, "Overall (no breakdown)"
-
-    return code, f"{selected_category} — {selected_subgroup}"
-
-
 def _render_analytical_query_tester() -> None:
     with st.expander("Analytical query test (developer view)", expanded=True):
         default_years_str = ",".join(str(y) for y in DEFAULT_SURVEY_YEARS)
@@ -361,14 +276,10 @@ def _render_analytical_query_tester() -> None:
                 "Survey years (comma-separated). Default = known cycles:",
                 value=default_years_str,
             )
-
-            # ✅ APPROVED CHANGE: Category → Subgroup selector (with safe fallback to manual DEMCODE)
-            try:
-                demo_df = load_demographics_meta(refresh=False)
-            except Exception:
-                demo_df = None
-
-            demcode_value, dem_ui_label = _dem_ui_resolve_demcode_and_labels(demo_df)
+            demcode_input = st.text_input(
+                "DEMCODE (leave blank for overall/no breakdown):",
+                value="",
+            )
 
             run_audit = st.checkbox(
                 "Run audit snapshot (optional)",
@@ -405,9 +316,12 @@ def _render_analytical_query_tester() -> None:
                 if not years:
                     raise QueryEngineError("No survey years specified.")
 
+                demcode = demcode_input.strip()
                 # Canonical representation:
                 #   None => overall (DEMCODE IS NULL OR '')
                 #   "1234" => subgroup
+                demcode_value = None if demcode == "" else demcode
+
                 params = QueryParameters(
                     survey_years=sorted(years),
                     question_code=question_code.strip(),
@@ -441,19 +355,12 @@ def _render_analytical_query_tester() -> None:
                     st.success("Analytical query succeeded.")
                     st.write(f"Question: {result.params.question_code} — {result.question_label_en}")
                     st.write(f"Organization: {result.org_label_en or '(label not found)'}")
-                    # ✅ show the selector label (Category — Subgroup (code)) when subgroup selected
-                    if result.params.demcode is None:
-                        st.write("Demographic: Overall (no breakdown)")
-                    else:
-                        st.write(f"Demographic: {dem_ui_label}")
+                    st.write(f"Demographic: {result.dem_label_en or 'Overall (no breakdown)'}")
                 else:
                     st.success("Analytical query + audit snapshot succeeded.")
                     st.write(f"Question: {snapshot.question_code} — {snapshot.question_label_en}")
                     st.write(f"Organization: {snapshot.org_label_en or '(label not found)'}")
-                    if result.params.demcode is None:
-                        st.write("Demographic: Overall (no breakdown)")
-                    else:
-                        st.write(f"Demographic: {dem_ui_label}")
+                    st.write(f"Demographic: {snapshot.dem_label_en or 'Overall (no breakdown)'}")
                     st.write(f"Metric: {snapshot.metric_name_en}")
 
                 rows = []
