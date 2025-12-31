@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
@@ -25,7 +25,6 @@ from pses_chatbot.core.query_engine import (
     QueryEngineError,
 )
 
-# Optional audit layer (off by default for basic query testing)
 try:
     from pses_chatbot.core.audit import build_audit_snapshot  # type: ignore
 except Exception:
@@ -39,7 +38,6 @@ ORG_LABEL_FR_COL = "org_name_fr"
 ORG_DEPT_CODE_COL = "dept_code"
 ORG_UNITID_COL = "UNITID"
 
-# Default years (confirmed cycles)
 DEFAULT_SURVEY_YEARS = [2019, 2020, 2022, 2024]
 
 
@@ -277,20 +275,22 @@ def _render_analytical_query_tester() -> None:
                 value=default_years_str,
             )
 
-            # DEMCODE selection (surgical): allow Category → Subgroup selection using DEMCODE metadata.
-            # Falls back to manual entry if metadata is unavailable or missing required columns.
+            # Demographic selection: Category dropdown + optional subgroup dropdown.
+            # - No category => overall
+            # - Category only => all subgroups (multi-demcode query)
+            # - Category + subgroup => single demcode
             demcode_value: Optional[str] = None
+            demcodes_value: Optional[List[str]] = None
+
             try:
                 dem_meta = load_demographics_meta(refresh=False)
             except Exception:
                 dem_meta = None
 
             if dem_meta is None or dem_meta.empty or ("category_en" not in dem_meta.columns) or ("label_en" not in dem_meta.columns) or ("demcode" not in dem_meta.columns):
-                demcode_input = st.text_input(
-                    "DEMCODE (leave blank for overall/no breakdown):",
-                    value="",
-                )
+                demcode_input = st.text_input("DEMCODE (leave blank for overall/no breakdown):", value="")
                 demcode_value = None if demcode_input.strip() == "" else demcode_input.strip()
+                demcodes_value = None
             else:
                 d = dem_meta.copy()
                 d["category_en"] = d["category_en"].fillna("").astype(str).str.strip()
@@ -299,23 +299,34 @@ def _render_analytical_query_tester() -> None:
 
                 categories = sorted([c for c in d["category_en"].unique().tolist() if c])
                 cat_choice = st.selectbox(
-                    "Demographic category:",
+                    "Demographic category (optional):",
                     options=["Overall (no breakdown)"] + categories,
                     index=0,
                 )
+
                 if cat_choice == "Overall (no breakdown)":
                     demcode_value = None
+                    demcodes_value = None
                 else:
-                    subset = d[d["category_en"] == cat_choice].copy()
-                    subset = subset[subset["demcode"] != ""]
+                    subset = d[(d["category_en"] == cat_choice) & (d["demcode"] != "")].copy()
                     subset = subset.sort_values(["label_en", "demcode"])
-                    options = [f"{r['label_en']} ({r['demcode']})" for _, r in subset.iterrows() if r["label_en"] and r["demcode"]]
-                    if not options:
-                        st.warning(f"No subgroups found for category: {cat_choice}")
+
+                    # Optional subgroup selection
+                    subgroup_options = ["All subgroups"] + [
+                        f"{r['label_en']} ({r['demcode']})"
+                        for _, r in subset.iterrows()
+                        if r["label_en"] and r["demcode"]
+                    ]
+
+                    sub_choice = st.selectbox("Demographic subgroup (optional):", options=subgroup_options, index=0)
+
+                    if sub_choice == "All subgroups":
+                        # Category-only query => multi-demcode
+                        demcodes_value = subset["demcode"].tolist()
                         demcode_value = None
                     else:
-                        sub_choice = st.selectbox("Demographic subgroup:", options=options, index=0)
                         demcode_value = sub_choice.rsplit("(", 1)[-1].rstrip(")").strip() or None
+                        demcodes_value = None
 
             run_audit = st.checkbox(
                 "Run audit snapshot (optional)",
@@ -356,12 +367,14 @@ def _render_analytical_query_tester() -> None:
                     survey_years=sorted(years),
                     question_code=question_code.strip(),
                     demcode=demcode_value,
+                    demcodes=demcodes_value,
                     org_levels=org_levels,
                 )
 
                 status.write(
                     f"Resolved params: years={params.survey_years}, "
-                    f"question={params.question_code}, demcode={params.demcode!r}, org={params.org_levels}"
+                    f"question={params.question_code}, demcode={params.demcode!r}, demcodes={'(multi)' if params.demcodes else None}, "
+                    f"org={params.org_levels}"
                 )
 
                 status.update(label="Step 1/2 — Running CKAN analytical query…", state="running")
@@ -381,10 +394,14 @@ def _render_analytical_query_tester() -> None:
 
                 status.update(label="Done.", state="complete")
 
-                if snapshot is None:
-                    st.success("Analytical query succeeded.")
-                    st.write(f"Question: {result.params.question_code} — {result.question_label_en}")
-                    st.write(f"Organization: {result.org_label_en or '(label not found)'}")
+                st.success("Analytical query succeeded.")
+                st.write(f"Question: {result.params.question_code} — {result.question_label_en}")
+                st.write(f"Organization: {result.org_label_en or '(label not found)'}")
+
+                # Demographic header line
+                if result.params.demcodes:
+                    st.write("Demographic: Category (all subgroups)")
+                else:
                     if result.params.demcode is None:
                         st.write("Demographic: Overall (no breakdown)")
                     else:
@@ -392,34 +409,36 @@ def _render_analytical_query_tester() -> None:
                             st.write(f"Demographic: {result.dem_category_en} — {result.dem_label_en or result.params.demcode}")
                         else:
                             st.write(f"Demographic: {result.dem_label_en or result.params.demcode}")
-                else:
-                    st.success("Analytical query + audit snapshot succeeded.")
-                    st.write(f"Question: {snapshot.question_code} — {snapshot.question_label_en}")
-                    st.write(f"Organization: {snapshot.org_label_en or '(label not found)'}")
-                    if result.params.demcode is None:
-                        st.write("Demographic: Overall (no breakdown)")
-                    else:
-                        snap_cat = getattr(snapshot, "dem_category_en", None)
-                        snap_lab = getattr(snapshot, "dem_label_en", None)
-                        cat = snap_cat or result.dem_category_en
-                        lab = snap_lab or result.dem_label_en
-                        if cat:
-                            st.write(f"Demographic: {cat} — {lab or result.params.demcode}")
-                        else:
-                            st.write(f"Demographic: {lab or result.params.demcode}")
-                    st.write(f"Metric: {snapshot.metric_name_en}")
 
-                rows = []
-                for m in result.yearly_metrics:
-                    rows.append(
-                        {
-                            "Year": m.year,
-                            "Value (Most positive / least negative)": m.value,
-                            "Δ vs previous year": m.delta_vs_prev,
-                            "N (ANSCOUNT)": m.n,
-                        }
-                    )
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                # Supporting metrics table
+                if result.metrics_by_demcode:
+                    rows = []
+                    for dem, metrics in result.metrics_by_demcode.items():
+                        for m in metrics:
+                            rows.append(
+                                {
+                                    "DEMCODE": dem,
+                                    "Year": m.year,
+                                    "Value (Most positive / least negative)": m.value,
+                                    "Δ vs previous year": m.delta_vs_prev,
+                                    "N (ANSCOUNT)": m.n,
+                                }
+                            )
+                    st.write("Supporting table (metrics by subgroup):")
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                else:
+                    rows = []
+                    for m in result.yearly_metrics:
+                        rows.append(
+                            {
+                                "Year": m.year,
+                                "Value (Most positive / least negative)": m.value,
+                                "Δ vs previous year": m.delta_vs_prev,
+                                "N (ANSCOUNT)": m.n,
+                            }
+                        )
+                    st.write("Supporting table (metrics):")
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
                 st.write("Supporting table (raw slice):")
                 st.dataframe(result.raw_df, use_container_width=True)
