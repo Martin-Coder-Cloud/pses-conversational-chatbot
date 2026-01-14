@@ -25,6 +25,25 @@ from pses_chatbot.core.query_engine import (
     QueryEngineError,
 )
 
+# Optional questionnaire search (lexical + semantic complements)
+try:
+    from pses_chatbot.utils.hybrid_search import (  # type: ignore
+        hybrid_question_search,
+        get_embedding_status,
+        get_last_search_metrics,
+    )
+except Exception:
+    try:
+        from pses_chatbot.core.hybrid_search import (  # type: ignore
+            hybrid_question_search,
+            get_embedding_status,
+            get_last_search_metrics,
+        )
+    except Exception:
+        hybrid_question_search = None  # type: ignore
+        get_embedding_status = None  # type: ignore
+        get_last_search_metrics = None  # type: ignore
+
 try:
     from pses_chatbot.core.audit import build_audit_snapshot  # type: ignore
 except Exception:
@@ -262,6 +281,130 @@ def _render_metadata_status() -> None:
                 st.code(repr(e))
 
 
+def _build_questions_qdf(lang_mode: str = "EN+FR") -> pd.DataFrame:
+    q = load_questions_meta(refresh=False)
+    if q is None or q.empty:
+        return pd.DataFrame(columns=["code", "text", "display"])
+
+    # Expected output of load_questions_meta(): code, text_en, text_fr
+    work = q.copy()
+    for c in ["code", "text_en", "text_fr"]:
+        if c in work.columns:
+            work[c] = work[c].apply(_normalize_text)
+
+    lang_mode = (lang_mode or "EN+FR").upper().strip()
+    if lang_mode == "EN":
+        text = work.get("text_en", "").fillna("").astype(str)
+        display = work.apply(lambda r: f"{r.get('code','')} — {r.get('text_en','')}".strip(" —"), axis=1)
+    elif lang_mode == "FR":
+        text = work.get("text_fr", "").fillna("").astype(str)
+        display = work.apply(lambda r: f"{r.get('code','')} — {r.get('text_fr','')}".strip(" —"), axis=1)
+    else:
+        en = work.get("text_en", "").fillna("").astype(str)
+        fr = work.get("text_fr", "").fillna("").astype(str)
+        text = (en + " " + fr).str.strip()
+        display = work.apply(
+            lambda r: f"{r.get('code','')} — {r.get('text_en','') or r.get('text_fr','')}".strip(" —"),
+            axis=1,
+        )
+
+    out = pd.DataFrame(
+        {
+            "code": work.get("code", "").fillna("").astype(str),
+            "text": text,
+            "display": display,
+        }
+    )
+    out = out[out["code"].astype(str).str.strip() != ""].reset_index(drop=True)
+    return out
+
+
+def _render_questionnaire_search() -> None:
+    with st.expander("Questionnaire search (developer view)", expanded=False):
+        if hybrid_question_search is None:
+            st.warning(
+                "Questionnaire search is not available because hybrid_search could not be imported. "
+                "Add the hybrid_search module under pses_chatbot/utils/ (or pses_chatbot/core/) and redeploy."
+            )
+            return
+
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            query = st.text_input("Search questionnaire (keywords, phrase, or Q##):", value="")
+        with col2:
+            lang_mode = st.selectbox("Search language", options=["EN+FR", "EN", "FR"], index=0)
+        with col3:
+            show_diag = st.checkbox("Show diagnostics", value=False)
+
+        colA, colB = st.columns(2)
+        with colA:
+            top_k = st.slider("Top K", min_value=5, max_value=50, value=15, step=1)
+        with colB:
+            min_score = st.slider("Min score", min_value=0.0, max_value=1.0, value=0.40, step=0.01)
+
+        run = st.button("Run questionnaire search", key="run_questionnaire_search_btn")
+
+        if show_diag and get_embedding_status is not None:
+            try:
+                st.write("Embedding status:")
+                st.json(get_embedding_status())
+            except Exception as e:
+                st.warning(f"Embedding status unavailable: {e!r}")
+
+        if run:
+            try:
+                qdf = _build_questions_qdf(lang_mode=lang_mode)
+                if qdf.empty:
+                    st.warning("Questions metadata is empty; cannot search.")
+                    return
+
+                with st.spinner("Searching questionnaire…"):
+                    res = hybrid_question_search(qdf, query, top_k=int(top_k), min_score=float(min_score))
+
+                if show_diag and get_last_search_metrics is not None:
+                    try:
+                        st.write("Last search metrics:")
+                        st.json(get_last_search_metrics())
+                    except Exception:
+                        pass
+
+                if res is None or res.empty:
+                    st.info("No matches found.")
+                    return
+
+                lex = res[res["origin"] == "lex"].copy()
+                sem = res[res["origin"] == "sem"].copy()
+
+                if not lex.empty:
+                    st.write("Lexical hits:")
+                    st.dataframe(
+                        lex[["code", "display", "score", "origin"]].reset_index(drop=True),
+                        use_container_width=True,
+                    )
+
+                if not sem.empty:
+                    st.write("Semantic-only complements:")
+                    st.dataframe(
+                        sem[["code", "display", "score", "origin"]].reset_index(drop=True),
+                        use_container_width=True,
+                    )
+
+                st.divider()
+                pick_map = {f"{r['code']} — {r['display']}": r["code"] for _, r in res.iterrows()}
+                pick = st.selectbox(
+                    "Set active question (used as default in Analytical query test):",
+                    options=["(do not set)"] + list(pick_map.keys()),
+                    index=0,
+                )
+                if pick != "(do not set)":
+                    st.session_state["active_question_code"] = pick_map[pick]
+                    st.success(f"Active question set to {st.session_state['active_question_code']}")
+
+            except Exception:
+                st.error("Error while searching questionnaire.")
+                st.text_area("Traceback", value=traceback.format_exc(), height=260)
+
+
 def _build_dem_lookup_en() -> Dict[str, Dict[str, str]]:
     """
     Returns demcode -> {label_en, category_en}
@@ -307,7 +450,10 @@ def _render_analytical_query_tester() -> None:
         col1, col2 = st.columns(2)
 
         with col1:
-            question_code = st.text_input("Question code (QUESTION, e.g. Q08):", value="Q08")
+            question_code = st.text_input(
+                "Question code (QUESTION, e.g. Q08):",
+                value=st.session_state.get("active_question_code", "Q08"),
+            )
             years_str = st.text_input(
                 "Survey years (comma-separated). Default = known cycles:",
                 value=default_years_str,
@@ -524,4 +670,5 @@ def run_app() -> None:
     _render_chat_area()
     _render_backend_status()
     _render_metadata_status()
+    _render_questionnaire_search()
     _render_analytical_query_tester()
