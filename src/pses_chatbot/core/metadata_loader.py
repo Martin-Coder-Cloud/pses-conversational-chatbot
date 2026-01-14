@@ -112,19 +112,7 @@ def load_scales_meta(refresh: bool = False) -> pd.DataFrame:
         return _SCALES_CACHE
 
     xls = _get_metadata_workbook(refresh=refresh)
-
-    # Your workbook stores scales under this sheet name:
-    sheet_name = "RESPONSE OPTIONS DE RÉPONSES"
-
-    try:
-        df = _strip_column_names(xls.parse(sheet_name, header=0))
-    except ValueError as e:
-        # Make debugging easy if the workbook is swapped or sheet renamed.
-        available = list(getattr(xls, "sheet_names", []))
-        raise ValueError(
-            f"Worksheet named '{sheet_name}' not found in metadata workbook. "
-            f"Available sheets: {available}"
-        ) from e
+    df = _strip_column_names(xls.parse("RESPONSE OPTIONS DE RÉPONSES", header=0))
 
     _SCALES_CACHE = df
     return df
@@ -238,7 +226,7 @@ def load_posneg_meta(refresh: bool = False) -> pd.DataFrame:
         return _POSNEG_CACHE
 
     xls = _get_metadata_workbook(refresh=refresh)
-    df = _strip_column_names(xls.parse("POSNEG", header=0))
+    df = _strip_column_names(xls.parse("POSITIVE_NEUTRAL_NEGATIVE_AGREE", header=0))
 
     _POSNEG_CACHE = df
     return df
